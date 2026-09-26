@@ -75,7 +75,15 @@ st.set_page_config(page_title="AI Bridge", layout="wide")
 if not check_password():
     st.stop()  # halts the script here - nothing below this line ever runs without the password
 
-from bridge import ask_claude, ask_chatgpt, debate, independent_answers, get_usage_summary
+from bridge import (
+    ask_claude_stream,
+    ask_chatgpt_stream,
+    ROLE_INSTRUCTIONS,
+    REVIEW_INSTRUCTION,
+    build_compare_prompt,
+    build_debate_message,
+    get_usage_summary,
+)
 from pypdf import PdfReader
 from docx import Document
 
@@ -242,23 +250,30 @@ if st.button("Ask") and question:
             st.warning(f"File was longer than {MAX_FILE_CHARS} characters - only the start was sent.")
         prompt = f"The user attached a file named '{uploaded_file.name}':\n\n{text}\n\nQuestion: {question}"
 
+    # Step 20: live streaming. Each answer below is shown with st.write_stream()
+    # right here, in this same run, as it's generated - the words appear
+    # progressively instead of a spinner followed by the full text all at
+    # once. st.write_stream() also returns the complete text once the stream
+    # ends, which is what gets saved into chat["history"] / chat["display"]
+    # exactly like before. This doesn't change token usage or cost at all -
+    # same request, same answer, just a different way of displaying it.
+
     if mode == "Single review":
         # Step 17: both models get the same shared context - see
         # second_opinion()'s docstring in bridge.py for how the reviewer
         # now sees the full history instead of just question+answer.
         chat["history"].append({"role": "user", "content": prompt})
 
-        with st.spinner(f"Asking {primary}..."):
-            first_answer = ask_claude(chat["history"]) if primary == "Claude" else ask_chatgpt(chat["history"])
+        st.markdown(f"**{primary}** (answering):")
+        stream = ask_claude_stream(chat["history"]) if primary == "Claude" else ask_chatgpt_stream(chat["history"])
+        first_answer = st.write_stream(stream)
         chat["history"].append({"role": "assistant", "content": first_answer})
 
         reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        reviewer_messages = chat["history"] + [{
-            "role": "user",
-            "content": "Critique the answer above - point out mistakes or gaps - then give your own improved answer.",
-        }]
-        with st.spinner(f"Asking {reviewer} for a second opinion..."):
-            second_answer = ask_chatgpt(reviewer_messages) if reviewer == "ChatGPT" else ask_claude(reviewer_messages)
+        reviewer_messages = chat["history"] + [{"role": "user", "content": REVIEW_INSTRUCTION}]
+        st.markdown(f"**{reviewer}** (reviewing):")
+        stream = ask_chatgpt_stream(reviewer_messages) if reviewer == "ChatGPT" else ask_claude_stream(reviewer_messages)
+        second_answer = st.write_stream(stream)
 
         chat["display"].append({
             "type": "single",
@@ -271,8 +286,15 @@ if st.button("Ask") and question:
     elif mode == "Independent answers":
         chat["history"].append({"role": "user", "content": prompt})
 
-        with st.spinner("Claude and ChatGPT are answering independently..."):
-            claude_answer, chatgpt_answer, comparison = independent_answers(chat["history"], question)
+        st.markdown("**Claude** (answering independently):")
+        claude_answer = st.write_stream(ask_claude_stream(chat["history"]))
+
+        st.markdown("**ChatGPT** (answering independently):")
+        chatgpt_answer = st.write_stream(ask_chatgpt_stream(chat["history"]))
+
+        compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
+        st.markdown("**Comparison:**")
+        comparison = st.write_stream(ask_claude_stream([{"role": "user", "content": compare_prompt}]))
 
         # The comparison (which references both answers) becomes this turn's
         # contribution to the shared history, so a follow-up question has a
@@ -288,13 +310,29 @@ if st.button("Ask") and question:
         })
 
     elif mode == "Debate":
-        # debate() doesn't touch chat["history"] - it's its own separate
-        # side conversation between the two models, not part of the
-        # ongoing shared context used for follow-up questions. It does
-        # rebuild the full debate transcript + original question every
-        # round internally - see bridge.py.
-        with st.spinner("Claude and ChatGPT are going back and forth..."):
-            transcript = debate(prompt, rounds=rounds, claude_role=claude_role, chatgpt_role=chatgpt_role)
+        # This doesn't touch chat["history"] - it's its own separate side
+        # conversation between the two models, not part of the ongoing
+        # shared context used for follow-up questions. Each round rebuilds
+        # the full transcript-so-far + original question from scratch (via
+        # build_debate_message), same as bridge.py's non-streaming debate().
+        roles = {"claude": claude_role, "chatgpt": chatgpt_role}
+        transcript = []
+        speaker = "claude"
+
+        for i in range(rounds):
+            speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
+            role_instruction = ROLE_INSTRUCTIONS[roles[speaker]]
+            message = build_debate_message(prompt, transcript, role_instruction)
+
+            st.markdown(f"**{speaker_name}** (round {i + 1}, {roles[speaker]}):")
+            if speaker == "claude":
+                reply = st.write_stream(ask_claude_stream([{"role": "user", "content": message}]))
+                speaker = "chatgpt"
+            else:
+                reply = st.write_stream(ask_chatgpt_stream([{"role": "user", "content": message}]))
+                speaker = "claude"
+
+            transcript.append((speaker_name, reply))
 
         chat["display"].append({
             "type": "debate",
@@ -307,8 +345,9 @@ if st.button("Ask") and question:
     else:  # One model only
         chat["history"].append({"role": "user", "content": prompt})
 
-        with st.spinner(f"Asking {which_model}..."):
-            answer = ask_claude(chat["history"]) if which_model == "Claude" else ask_chatgpt(chat["history"])
+        st.markdown(f"**{which_model}:**")
+        stream = ask_claude_stream(chat["history"]) if which_model == "Claude" else ask_chatgpt_stream(chat["history"])
+        answer = st.write_stream(stream)
         chat["history"].append({"role": "assistant", "content": answer})
 
         chat["display"].append({

@@ -51,14 +51,21 @@ usage_totals = {
 }
 
 
+# 8192 instead of 800: newer Claude models spend part of this budget
+# "thinking" before answering, and on a meaty or long-running task (reviewing
+# a whole document, a debate several rounds deep where the transcript-so-far
+# keeps growing) that thinking alone can eat a smaller cap entirely, leaving
+# nothing for the actual answer. This is a ceiling, not a target - raising it
+# doesn't cost more unless the model actually needed the extra room.
+MAX_TOKENS = 8192
+
+CUTOFF_NOTE = "\n\n[Answer cut off - it ran out of its token budget. Consider raising MAX_TOKENS in bridge.py.]"
+
+
 def ask_claude(messages):
     response = claude.messages.create(
-        # 4096 instead of 800: newer Claude models spend part of this budget
-        # "thinking" before answering, and on a meaty question (reviewing a
-        # whole document, say) that thinking alone can eat the entire old
-        # 800-token cap, leaving nothing for the actual answer.
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=MAX_TOKENS,
         messages=messages,
     )
     usage_totals["claude_input_tokens"] += response.usage.input_tokens
@@ -70,23 +77,88 @@ def ask_claude(messages):
     # always content[0].
     for block in response.content:
         if block.type == "text":
-            return block.text
+            text = block.text
+            # stop_reason == "max_tokens" means it was cut off mid-answer
+            # (possibly mid-sentence) rather than finishing naturally -
+            # flagging that visibly beats a truncated answer that silently
+            # looks complete.
+            if response.stop_reason == "max_tokens":
+                text += CUTOFF_NOTE
+            return text
 
-    # No text block at all - most likely max_tokens ran out mid-thought.
-    # Returning a visible message here instead of "" means this shows up
-    # clearly in the UI instead of looking like a silent, confusing blank.
-    return "[Claude gave no answer text - it likely ran out of its token budget while thinking. Try a shorter question, or raise max_tokens in bridge.py.]"
+    # No text block at all - most likely max_tokens ran out mid-thought,
+    # before any answer text was produced. Returning a visible message here
+    # instead of "" means this shows up clearly in the UI instead of looking
+    # like a silent, confusing blank.
+    return "[Claude gave no answer text - it ran out of its token budget while thinking. Try a shorter question, or raise MAX_TOKENS in bridge.py.]"
 
 
 def ask_chatgpt(messages):
     response = chatgpt.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
+        max_completion_tokens=MAX_TOKENS,
     )
     usage_totals["openai_input_tokens"] += response.usage.prompt_tokens
     usage_totals["openai_output_tokens"] += response.usage.completion_tokens
 
-    return response.choices[0].message.content
+    text = response.choices[0].message.content or ""
+    if response.choices[0].finish_reason == "length":
+        text += CUTOFF_NOTE
+    return text
+
+
+# ---- Step 20: streaming versions ----
+#
+# These do the exact same thing as ask_claude() / ask_chatgpt() above, but
+# instead of blocking until the whole answer is ready and returning it as
+# one string, they're generators: each `yield` hands back the next small
+# chunk of text as soon as the model produces it. A caller that wants the
+# old all-at-once behavior can still do "".join(ask_claude_stream(messages)).
+# Streaming doesn't use more tokens or cost more - it's the exact same
+# request, just delivered progressively instead of in one lump.
+
+def ask_claude_stream(messages):
+    with claude.messages.stream(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=messages,
+    ) as stream:
+        # .text_stream yields only the actual answer text, skipping over any
+        # "thinking" content - same underlying distinction as the ThinkingBlock
+        # check in ask_claude() above, just handled by the SDK during streaming.
+        for chunk in stream.text_stream:
+            yield chunk
+
+        final_message = stream.get_final_message()
+        usage_totals["claude_input_tokens"] += final_message.usage.input_tokens
+        usage_totals["claude_output_tokens"] += final_message.usage.output_tokens
+
+        if final_message.stop_reason == "max_tokens":
+            yield CUTOFF_NOTE
+
+
+def ask_chatgpt_stream(messages):
+    finish_reason = None
+    stream = chatgpt.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        max_completion_tokens=MAX_TOKENS,
+        stream=True,
+        stream_options={"include_usage": True},  # asks for a final usage-only chunk
+    )
+    for chunk in stream:
+        if chunk.usage is not None:
+            usage_totals["openai_input_tokens"] += chunk.usage.prompt_tokens
+            usage_totals["openai_output_tokens"] += chunk.usage.completion_tokens
+        if chunk.choices:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+    if finish_reason == "length":
+        yield CUTOFF_NOTE
 
 
 def _cost(model_name, input_tokens, output_tokens):
@@ -132,6 +204,33 @@ def ask(question, target="claude"):
     return answer
 
 
+# Shared, reusable prompt pieces - defined once here so both the plain
+# (non-streaming) functions below and app.py's streaming version of the same
+# flows use identical wording, instead of two copies that can drift apart.
+REVIEW_INSTRUCTION = "Critique the answer above - point out mistakes or gaps - then give your own improved answer."
+
+
+def build_compare_prompt(question, claude_answer, chatgpt_answer):
+    return (
+        "Two AI models independently answered the question below, without "
+        "seeing each other's response. Compare their answers: where do they "
+        "agree, where do they disagree, and which parts of each seem more "
+        "reliable?\n\n"
+        f"Question: {question}\n\n"
+        f"Model A (Claude):\n{claude_answer}\n\n"
+        f"Model B (ChatGPT):\n{chatgpt_answer}"
+    )
+
+
+def build_debate_message(question, transcript, role_instruction):
+    so_far = "\n\n".join(f"{name}: {reply}" for name, reply in transcript)
+    message = f"Question: {question}\n\n"
+    if so_far:
+        message += f"Debate so far:\n{so_far}\n\n"
+    message += f"Your role: {role_instruction}"
+    return message
+
+
 def second_opinion(question, primary="claude"):
     """One model answers, the other is shown the same shared context plus
     that answer, and asked to critique and improve it. `primary` picks who
@@ -143,10 +242,7 @@ def second_opinion(question, primary="claude"):
     critique is grounded in the same information the first model had."""
     first = ask(question, target=primary)
 
-    reviewer_messages = history + [{
-        "role": "user",
-        "content": "Critique the answer above - point out mistakes or gaps - then give your own improved answer.",
-    }]
+    reviewer_messages = history + [{"role": "user", "content": REVIEW_INSTRUCTION}]
     reviewer = ask_chatgpt if primary == "claude" else ask_claude
     second = reviewer(reviewer_messages)
     return first, second
@@ -182,12 +278,7 @@ def debate(question, rounds=3, claude_role="Proposer", chatgpt_role="Critic"):
     for i in range(rounds):
         speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
         role_instruction = ROLE_INSTRUCTIONS[roles[speaker]]
-
-        so_far = "\n\n".join(f"{name}: {reply}" for name, reply in transcript)
-        message = f"Question: {question}\n\n"
-        if so_far:
-            message += f"Debate so far:\n{so_far}\n\n"
-        message += f"Your role: {role_instruction}"
+        message = build_debate_message(question, transcript, role_instruction)
 
         if speaker == "claude":
             reply = ask_claude([{"role": "user", "content": message}])
@@ -214,15 +305,7 @@ def independent_answers(messages, question):
     claude_answer = ask_claude(messages)
     chatgpt_answer = ask_chatgpt(messages)
 
-    compare_prompt = (
-        "Two AI models independently answered the question below, without "
-        "seeing each other's response. Compare their answers: where do they "
-        "agree, where do they disagree, and which parts of each seem more "
-        "reliable?\n\n"
-        f"Question: {question}\n\n"
-        f"Model A (Claude):\n{claude_answer}\n\n"
-        f"Model B (ChatGPT):\n{chatgpt_answer}"
-    )
+    compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
     comparison = ask_claude([{"role": "user", "content": compare_prompt}])
     return claude_answer, chatgpt_answer, comparison
 
