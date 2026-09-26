@@ -41,7 +41,10 @@ load_dotenv()
 try:
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_MODEL", "OPENAI_MODEL", "APP_PASSWORD"):
         if key in st.secrets:
-            os.environ.setdefault(key, st.secrets[key])
+            # .strip() guards against a stray newline or trailing space that
+            # can sneak in when copy-pasting a long key - those are invisible
+            # to look at but break the actual API request.
+            os.environ.setdefault(key, str(st.secrets[key]).strip())
 except Exception:
     pass  # no secrets configured (e.g. running locally with just a .env file) - that's fine
 
@@ -92,7 +95,13 @@ def list_chats():
 
 
 def load_chat(chat_id):
-    with open(os.path.join(CHATS_DIR, f"{chat_id}.json"), "r", encoding="utf-8") as f:
+    """Returns None if this chat's file doesn't exist - which happens if
+    the app's storage got reset (e.g. a redeploy or reboot) after a browser
+    tab already had this chat open."""
+    path = os.path.join(CHATS_DIR, f"{chat_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -149,6 +158,12 @@ for chat_id, title in list_chats():
 # ---- Main area: the open chat ----
 
 chat = load_chat(st.session_state.current_chat_id)
+if chat is None:
+    # The chat this browser tab remembered no longer exists on disk (storage
+    # got reset) - start a fresh one instead of crashing.
+    st.session_state.current_chat_id = create_chat()
+    chat = load_chat(st.session_state.current_chat_id)
+
 st.title(chat["title"])
 
 uploaded_file = st.file_uploader("Attach a file (optional)")

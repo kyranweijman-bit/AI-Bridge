@@ -13,11 +13,13 @@ from anthropic import Anthropic
 from openai import OpenAI
 
 load_dotenv()
-claude = Anthropic()
-chatgpt = OpenAI()
+# .strip() guards against a stray newline or trailing space in a copy-pasted
+# key or model name - invisible to look at, but enough to break a request.
+claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
+chatgpt = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
 
-CLAUDE_MODEL = os.environ["CLAUDE_MODEL"]
-OPENAI_MODEL = os.environ["OPENAI_MODEL"]
+CLAUDE_MODEL = os.environ["CLAUDE_MODEL"].strip()
+OPENAI_MODEL = os.environ["OPENAI_MODEL"].strip()
 
 HISTORY_FILE = "history.json"
 
