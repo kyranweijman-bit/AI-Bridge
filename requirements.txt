@@ -4,3 +4,5 @@ python-dotenv
 streamlit
 pypdf
 python-docx
+psycopg[binary,pool]
+httpx

@@ -42,6 +42,23 @@ PRICING = {
     "gpt-5.5": {"input": 5.00, "output": 30.00},
 }
 
+# Step 21: set by app.py to a function(provider, model, input_tokens,
+# output_tokens, cost) that saves each call to the database. bridge.py itself
+# doesn't know about the database - it just calls this if it's set.
+usage_callback = None
+
+
+def _record_usage(provider, model, input_tokens, output_tokens):
+    if usage_callback is None:
+        return
+    try:
+        usage_callback(provider, model, input_tokens, output_tokens,
+                       _cost(model, input_tokens, output_tokens))
+    except Exception as e:
+        # Never let a logging problem break an answer.
+        print(f"Couldn't log usage: {e}")
+
+
 # Running totals for this process's lifetime - resets when the app restarts.
 usage_totals = {
     "claude_input_tokens": 0,
@@ -62,14 +79,27 @@ MAX_TOKENS = 8192
 CUTOFF_NOTE = "\n\n[Answer cut off - it ran out of its token budget. Consider raising MAX_TOKENS in bridge.py.]"
 
 
-def ask_claude(messages):
-    response = claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=messages,
-    )
+# Step 21: every ask_* function takes an optional `system` - a standing
+# instruction sent alongside the conversation. app.py uses it for memory.
+# Claude takes it as a separate `system` parameter; OpenAI as a first
+# message with role "system".
+
+def _claude_kwargs(messages, system):
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": MAX_TOKENS, "messages": messages}
+    if system:
+        kwargs["system"] = system
+    return kwargs
+
+
+def _openai_messages(messages, system):
+    return ([{"role": "system", "content": system}] if system else []) + list(messages)
+
+
+def ask_claude(messages, system=None):
+    response = claude.messages.create(**_claude_kwargs(messages, system))
     usage_totals["claude_input_tokens"] += response.usage.input_tokens
     usage_totals["claude_output_tokens"] += response.usage.output_tokens
+    _record_usage("anthropic", CLAUDE_MODEL, response.usage.input_tokens, response.usage.output_tokens)
 
     # Newer Claude models sometimes "think" before answering, which shows up
     # as an extra ThinkingBlock ahead of the actual answer in response.content.
@@ -93,14 +123,15 @@ def ask_claude(messages):
     return "[Claude gave no answer text - it ran out of its token budget while thinking. Try a shorter question, or raise MAX_TOKENS in bridge.py.]"
 
 
-def ask_chatgpt(messages):
+def ask_chatgpt(messages, system=None):
     response = chatgpt.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=messages,
+        messages=_openai_messages(messages, system),
         max_completion_tokens=MAX_TOKENS,
     )
     usage_totals["openai_input_tokens"] += response.usage.prompt_tokens
     usage_totals["openai_output_tokens"] += response.usage.completion_tokens
+    _record_usage("openai", OPENAI_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens)
 
     text = response.choices[0].message.content or ""
     if response.choices[0].finish_reason == "length":
@@ -118,12 +149,8 @@ def ask_chatgpt(messages):
 # Streaming doesn't use more tokens or cost more - it's the exact same
 # request, just delivered progressively instead of in one lump.
 
-def ask_claude_stream(messages):
-    with claude.messages.stream(
-        model=CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=messages,
-    ) as stream:
+def ask_claude_stream(messages, system=None):
+    with claude.messages.stream(**_claude_kwargs(messages, system)) as stream:
         # .text_stream yields only the actual answer text, skipping over any
         # "thinking" content - same underlying distinction as the ThinkingBlock
         # check in ask_claude() above, just handled by the SDK during streaming.
@@ -133,16 +160,17 @@ def ask_claude_stream(messages):
         final_message = stream.get_final_message()
         usage_totals["claude_input_tokens"] += final_message.usage.input_tokens
         usage_totals["claude_output_tokens"] += final_message.usage.output_tokens
+        _record_usage("anthropic", CLAUDE_MODEL, final_message.usage.input_tokens, final_message.usage.output_tokens)
 
         if final_message.stop_reason == "max_tokens":
             yield CUTOFF_NOTE
 
 
-def ask_chatgpt_stream(messages):
+def ask_chatgpt_stream(messages, system=None):
     finish_reason = None
     stream = chatgpt.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=messages,
+        messages=_openai_messages(messages, system),
         max_completion_tokens=MAX_TOKENS,
         stream=True,
         stream_options={"include_usage": True},  # asks for a final usage-only chunk
@@ -151,6 +179,7 @@ def ask_chatgpt_stream(messages):
         if chunk.usage is not None:
             usage_totals["openai_input_tokens"] += chunk.usage.prompt_tokens
             usage_totals["openai_output_tokens"] += chunk.usage.completion_tokens
+            _record_usage("openai", OPENAI_MODEL, chunk.usage.prompt_tokens, chunk.usage.completion_tokens)
         if chunk.choices:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content

@@ -7,20 +7,15 @@ Run it with:                 streamlit run app.py
 
 Streamlit reruns this whole file top-to-bottom on every click. That's why
 state that needs to survive a click (which chat is open, its messages)
-either lives in a file on disk (chats/<id>.json) or in st.session_state,
-which Streamlit itself preserves across reruns.
+either lives in the database (see db.py) or in st.session_state, which
+Streamlit itself preserves across reruns.
 """
 
 import os
-import json
-import uuid
 import streamlit as st
 from dotenv import load_dotenv
 
-CHATS_DIR = "chats"
 MAX_FILE_CHARS = 20000  # cap how much of an uploaded file we send, to control cost
-
-os.makedirs(CHATS_DIR, exist_ok=True)
 
 # Load .env right away, before the password check below runs - bridge.py
 # also calls this, but that import happens *after* the password gate, which
@@ -39,7 +34,8 @@ load_dotenv()
 # This copies them into the normal environment variables so bridge.py
 # doesn't need to know or care which situation it's running in.
 try:
-    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_MODEL", "OPENAI_MODEL", "APP_PASSWORD"):
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_MODEL", "OPENAI_MODEL", "APP_PASSWORD",
+                "DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
         if key in st.secrets:
             # .strip() guards against a stray newline or trailing space that
             # can sneak in when copy-pasting a long key - those are invisible
@@ -75,6 +71,8 @@ st.set_page_config(page_title="AI Bridge", layout="wide")
 if not check_password():
     st.stop()  # halts the script here - nothing below this line ever runs without the password
 
+import bridge
+import db
 from bridge import (
     ask_claude_stream,
     ask_chatgpt_stream,
@@ -82,7 +80,6 @@ from bridge import (
     REVIEW_INSTRUCTION,
     build_compare_prompt,
     build_debate_message,
-    get_usage_summary,
 )
 from pypdf import PdfReader
 from docx import Document
@@ -106,52 +103,39 @@ def extract_file_text(uploaded_file):
     return uploaded_file.read().decode("utf-8", errors="replace")
 
 
-# ---- Chat storage: one small JSON file per chat in chats/ ----
+# ---- Step 21: storage lives in a database (db.py) ----
 
-def list_chats():
-    """Return [(chat_id, title), ...] for every saved chat, most recently
-    used first."""
-    rows = []
-    for filename in os.listdir(CHATS_DIR):
-        if filename.endswith(".json"):
-            path = os.path.join(CHATS_DIR, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            rows.append((filename[:-5], data.get("title", "New chat"), os.path.getmtime(path)))
-    rows.sort(key=lambda r: r[2], reverse=True)
-    return [(chat_id, title) for chat_id, title, _ in rows]
+@st.cache_resource
+def connect_database():
+    """Runs once per app start (not on every click): opens the connection
+    and creates any missing tables."""
+    db.init_schema()
+    return True
 
 
-def load_chat(chat_id):
-    """Returns None if this chat's file doesn't exist - which happens if
-    the app's storage got reset (e.g. a redeploy or reboot) after a browser
-    tab already had this chat open."""
-    path = os.path.join(CHATS_DIR, f"{chat_id}.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+try:
+    connect_database()
+except Exception as e:
+    st.error(f"Couldn't connect to the database: {e}")
+    st.info("Check DATABASE_URL in .env (locally) or in the app's Secrets on Streamlit Cloud. See SETUP_DATABASE.md.")
+    st.stop()
 
 
-def save_chat(chat_id, chat):
-    with open(os.path.join(CHATS_DIR, f"{chat_id}.json"), "w", encoding="utf-8") as f:
-        json.dump(chat, f, indent=2, ensure_ascii=False)
+def _log_usage(provider, model, input_tokens, output_tokens, cost):
+    # st.session_state here is the session of whoever pressed Ask, because
+    # this is called from inside that session's own script run.
+    db.log_usage(provider, model, input_tokens, output_tokens, cost,
+                 chat_id=st.session_state.get("current_chat_id"))
 
 
-def create_chat():
-    chat_id = str(uuid.uuid4())
-    # "history" is the Claude/OpenAI-format message list (used for follow-up
-    # context). "display" is what we show on screen: each question plus
-    # both answers, kept separately so we can render and download them.
-    save_chat(chat_id, {"title": "New chat", "history": [], "display": []})
-    return chat_id
+bridge.usage_callback = _log_usage
 
 
 # ---- Pick which chat is open ----
 
 if "current_chat_id" not in st.session_state:
-    existing = list_chats()
-    st.session_state.current_chat_id = existing[0][0] if existing else create_chat()
+    existing = db.list_chats()
+    st.session_state.current_chat_id = existing[0][0] if existing else db.create_chat()
 
 
 # ---- Sidebar: the chat list ----
@@ -159,12 +143,15 @@ if "current_chat_id" not in st.session_state:
 st.sidebar.title("Chats")
 
 if st.sidebar.button("+ New chat", use_container_width=True):
-    st.session_state.current_chat_id = create_chat()
+    st.session_state.current_chat_id = db.create_chat()
     st.rerun()
+
+search = st.sidebar.text_input("Search chats", placeholder="Search titles and messages")
 
 st.sidebar.divider()
 
-for chat_id, title in list_chats():
+chat_list = db.search_chats(search) if search else db.list_chats()
+for chat_id, title in chat_list:
     label = title or "New chat"
     if chat_id == st.session_state.current_chat_id:
         label = f"-> {label}"
@@ -176,46 +163,81 @@ for chat_id, title in list_chats():
             st.rerun()
     with col2:
         if st.button("x", key=f"del_{chat_id}"):
-            os.remove(os.path.join(CHATS_DIR, f"{chat_id}.json"))
+            db.delete_chat(chat_id)
             if st.session_state.current_chat_id == chat_id:
-                remaining = list_chats()
-                st.session_state.current_chat_id = remaining[0][0] if remaining else create_chat()
+                remaining = db.list_chats()
+                st.session_state.current_chat_id = remaining[0][0] if remaining else db.create_chat()
+            st.rerun()
+
+if search and not chat_list:
+    st.sidebar.caption("No chats match.")
+
+
+# ---- Step 21: memory ----
+#
+# Memories are sent to both models as a standing instruction on every call.
+# "All chats" ones apply everywhere; "This chat only" ones just here.
+st.sidebar.divider()
+with st.sidebar.expander("Memory"):
+    for m in db.list_memories(st.session_state.current_chat_id):
+        scope = "all chats" if m["chat_id"] is None else "this chat"
+        mcol1, mcol2 = st.columns([5, 1])
+        mcol1.caption(f"{m['content']}  \n*({scope})*")
+        if mcol2.button("x", key=f"mem_del_{m['id']}"):
+            db.delete_memory(m["id"])
+            st.rerun()
+
+    with st.form("add_memory", clear_on_submit=True):
+        new_memory = st.text_area("Remember...", placeholder="e.g. I study at HAN; answer in English")
+        memory_scope = st.radio("Applies to", ["All chats", "This chat only"], horizontal=True)
+        if st.form_submit_button("Save to memory") and new_memory.strip():
+            db.add_memory(
+                new_memory,
+                chat_id=None if memory_scope == "All chats" else st.session_state.current_chat_id,
+            )
             st.rerun()
 
 
-# ---- Step 16: cost visibility ----
-#
-# usage_totals lives in bridge.py's memory, so this resets whenever the app
-# process restarts (every redeploy, every local re-run) - it's "since this
-# app last started," not a permanent lifetime total.
+# ---- Step 16/21: cost visibility, now saved permanently ----
 st.sidebar.divider()
-with st.sidebar.expander("Usage since last restart"):
-    usage = get_usage_summary()
-
-    st.write(f"Claude: {usage['claude']['input_tokens']:,} in / {usage['claude']['output_tokens']:,} out")
-    if usage["claude"]["cost"] is not None:
-        st.write(f"≈ ${usage['claude']['cost']:.4f}")
-
-    st.write(f"ChatGPT: {usage['openai']['input_tokens']:,} in / {usage['openai']['output_tokens']:,} out")
-    if usage["openai"]["cost"] is not None:
-        st.write(f"≈ ${usage['openai']['cost']:.4f}")
-
-    if usage["total_cost"] is not None:
-        st.markdown(f"**Total: ≈ ${usage['total_cost']:.4f}**")
-    else:
-        st.caption("No cost estimate - configured model isn't in the pricing table in bridge.py.")
+with st.sidebar.expander("Usage"):
+    usage = db.usage_summary(st.session_state.current_chat_id)
+    st.write(f"Today: ≈ ${usage['today_cost']:.4f}")
+    st.write(f"This chat: ≈ ${usage['chat_cost']:.4f}")
+    st.markdown(f"**All time: ≈ ${usage['total_cost']:.4f}**")
+    st.caption(f"{usage['total_tokens']:,} tokens in total")
+    for row in db.usage_by_model():
+        cost = f"≈ ${float(row['cost']):.4f}" if row["cost"] is not None else "no price known"
+        st.caption(f"{row['model']}: {int(row['input_tokens']):,} in / {int(row['output_tokens']):,} out, {cost}")
+    if usage["unpriced_calls"]:
+        st.caption("Some calls have no cost estimate - their model isn't in the PRICING table in bridge.py.")
 
 
 # ---- Main area: the open chat ----
 
-chat = load_chat(st.session_state.current_chat_id)
+chat = db.load_chat(st.session_state.current_chat_id)
 if chat is None:
-    # The chat this browser tab remembered no longer exists on disk (storage
-    # got reset) - start a fresh one instead of crashing.
-    st.session_state.current_chat_id = create_chat()
-    chat = load_chat(st.session_state.current_chat_id)
+    # The chat this browser tab remembered was deleted (e.g. in another
+    # tab) - start a fresh one instead of crashing.
+    st.session_state.current_chat_id = db.create_chat()
+    chat = db.load_chat(st.session_state.current_chat_id)
 
-st.title(chat["title"])
+chat_id = st.session_state.current_chat_id
+turn_index = len(chat["display"])
+memory = db.memory_prompt(chat_id)  # sent to both models as a system prompt
+
+title_col, pin_col = st.columns([8, 1])
+title_col.title(chat["title"])
+with pin_col:
+    if st.button("Unpin" if chat["pinned"] else "Pin", help="Pinned chats stay at the top of the list"):
+        db.set_pinned(chat_id, not chat["pinned"])
+        st.rerun()
+
+with st.expander("Rename chat"):
+    new_title = st.text_input("New name", value=chat["title"], key=f"rename_{chat_id}")
+    if st.button("Save name") and new_title.strip():
+        db.rename_chat(chat_id, new_title.strip()[:100])
+        st.rerun()
 
 uploaded_file = st.file_uploader("Attach a file (optional)")
 question = st.text_input("Ask a question")
@@ -250,6 +272,10 @@ if st.button("Ask") and question:
             st.warning(f"File was longer than {MAX_FILE_CHARS} characters - only the start was sent.")
         prompt = f"The user attached a file named '{uploaded_file.name}':\n\n{text}\n\nQuestion: {question}"
 
+        warning = db.save_file(chat_id, turn_index, uploaded_file.name, text, uploaded_file.getvalue())
+        if warning:
+            st.warning(warning)
+
     # Step 20: live streaming. Each answer below is shown with st.write_stream()
     # right here, in this same run, as it's generated - the words appear
     # progressively instead of a spinner followed by the full text all at
@@ -265,14 +291,14 @@ if st.button("Ask") and question:
         chat["history"].append({"role": "user", "content": prompt})
 
         st.markdown(f"**{primary}** (answering):")
-        stream = ask_claude_stream(chat["history"]) if primary == "Claude" else ask_chatgpt_stream(chat["history"])
+        stream = ask_claude_stream(chat["history"], system=memory) if primary == "Claude" else ask_chatgpt_stream(chat["history"], system=memory)
         first_answer = st.write_stream(stream)
         chat["history"].append({"role": "assistant", "content": first_answer})
 
         reviewer = "ChatGPT" if primary == "Claude" else "Claude"
         reviewer_messages = chat["history"] + [{"role": "user", "content": REVIEW_INSTRUCTION}]
         st.markdown(f"**{reviewer}** (reviewing):")
-        stream = ask_chatgpt_stream(reviewer_messages) if reviewer == "ChatGPT" else ask_claude_stream(reviewer_messages)
+        stream = ask_chatgpt_stream(reviewer_messages, system=memory) if reviewer == "ChatGPT" else ask_claude_stream(reviewer_messages, system=memory)
         second_answer = st.write_stream(stream)
 
         chat["display"].append({
@@ -287,14 +313,14 @@ if st.button("Ask") and question:
         chat["history"].append({"role": "user", "content": prompt})
 
         st.markdown("**Claude** (answering independently):")
-        claude_answer = st.write_stream(ask_claude_stream(chat["history"]))
+        claude_answer = st.write_stream(ask_claude_stream(chat["history"], system=memory))
 
         st.markdown("**ChatGPT** (answering independently):")
-        chatgpt_answer = st.write_stream(ask_chatgpt_stream(chat["history"]))
+        chatgpt_answer = st.write_stream(ask_chatgpt_stream(chat["history"], system=memory))
 
         compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
         st.markdown("**Comparison:**")
-        comparison = st.write_stream(ask_claude_stream([{"role": "user", "content": compare_prompt}]))
+        comparison = st.write_stream(ask_claude_stream([{"role": "user", "content": compare_prompt}], system=memory))
 
         # The comparison (which references both answers) becomes this turn's
         # contribution to the shared history, so a follow-up question has a
@@ -326,10 +352,10 @@ if st.button("Ask") and question:
 
             st.markdown(f"**{speaker_name}** (round {i + 1}, {roles[speaker]}):")
             if speaker == "claude":
-                reply = st.write_stream(ask_claude_stream([{"role": "user", "content": message}]))
+                reply = st.write_stream(ask_claude_stream([{"role": "user", "content": message}], system=memory))
                 speaker = "chatgpt"
             else:
-                reply = st.write_stream(ask_chatgpt_stream([{"role": "user", "content": message}]))
+                reply = st.write_stream(ask_chatgpt_stream([{"role": "user", "content": message}], system=memory))
                 speaker = "claude"
 
             transcript.append((speaker_name, reply))
@@ -346,7 +372,7 @@ if st.button("Ask") and question:
         chat["history"].append({"role": "user", "content": prompt})
 
         st.markdown(f"**{which_model}:**")
-        stream = ask_claude_stream(chat["history"]) if which_model == "Claude" else ask_chatgpt_stream(chat["history"])
+        stream = ask_claude_stream(chat["history"], system=memory) if which_model == "Claude" else ask_chatgpt_stream(chat["history"], system=memory)
         answer = st.write_stream(stream)
         chat["history"].append({"role": "assistant", "content": answer})
 
@@ -357,10 +383,10 @@ if st.button("Ask") and question:
             "answer": answer,
         })
 
+    db.add_turn(chat_id, turn_index, chat["display"][-1], prompt)
     if chat["title"] == "New chat":
-        chat["title"] = question[:40]
+        db.rename_chat(chat_id, question[:40])
 
-    save_chat(st.session_state.current_chat_id, chat)
     st.rerun()
 
 st.divider()
