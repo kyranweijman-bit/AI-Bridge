@@ -75,7 +75,7 @@ st.set_page_config(page_title="AI Bridge", layout="wide")
 if not check_password():
     st.stop()  # halts the script here - nothing below this line ever runs without the password
 
-from bridge import ask_claude, ask_chatgpt
+from bridge import ask_claude, ask_chatgpt, debate
 
 
 # ---- Chat storage: one small JSON file per chat in chats/ ----
@@ -169,6 +169,14 @@ st.title(chat["title"])
 uploaded_file = st.file_uploader("Attach a file (optional)")
 question = st.text_input("Ask a question")
 
+# Step 13: let you pick per-question whether you want a single review
+# (Claude answers, ChatGPT critiques it) or a multi-round debate.
+mode = st.radio(
+    "Mode",
+    ["Single review", "Debate (3 rounds)"],
+    horizontal=True,
+)
+
 if st.button("Ask") and question:
     prompt = question
 
@@ -179,21 +187,39 @@ if st.button("Ask") and question:
             st.warning(f"File was longer than {MAX_FILE_CHARS} characters - only the start was sent.")
         prompt = f"The user attached a file named '{uploaded_file.name}':\n\n{text}\n\nQuestion: {question}"
 
-    chat["history"].append({"role": "user", "content": prompt})
+    if mode == "Single review":
+        chat["history"].append({"role": "user", "content": prompt})
 
-    with st.spinner("Asking Claude..."):
-        claude_answer = ask_claude(chat["history"])
-    chat["history"].append({"role": "assistant", "content": claude_answer})
+        with st.spinner("Asking Claude..."):
+            claude_answer = ask_claude(chat["history"])
+        chat["history"].append({"role": "assistant", "content": claude_answer})
 
-    with st.spinner("Asking ChatGPT for a second opinion..."):
-        review_prompt = (
-            "Another AI answered the question below. "
-            "Point out mistakes or gaps, then give your own improved answer.\n\n"
-            f"Question: {question}\n\nAnswer:\n{claude_answer}"
-        )
-        chatgpt_answer = ask_chatgpt([{"role": "user", "content": review_prompt}])
+        with st.spinner("Asking ChatGPT for a second opinion..."):
+            review_prompt = (
+                "Another AI answered the question below. "
+                "Point out mistakes or gaps, then give your own improved answer.\n\n"
+                f"Question: {question}\n\nAnswer:\n{claude_answer}"
+            )
+            chatgpt_answer = ask_chatgpt([{"role": "user", "content": review_prompt}])
 
-    chat["display"].append({"question": question, "claude": claude_answer, "chatgpt": chatgpt_answer})
+        chat["display"].append({
+            "type": "single",
+            "question": question,
+            "claude": claude_answer,
+            "chatgpt": chatgpt_answer,
+        })
+    else:
+        # debate() doesn't touch chat["history"] - it's its own separate
+        # side conversation between the two models, not part of the
+        # ongoing shared context used for follow-up questions.
+        with st.spinner("Claude and ChatGPT are going back and forth..."):
+            transcript = debate(prompt, rounds=3)
+
+        chat["display"].append({
+            "type": "debate",
+            "question": question,
+            "transcript": transcript,
+        })
 
     if chat["title"] == "New chat":
         chat["title"] = question[:40]
@@ -204,26 +230,38 @@ if st.button("Ask") and question:
 st.divider()
 
 # Show the conversation so far, oldest first, each answer with its own
-# download button.
+# download button. Older chats saved before this mode toggle existed have
+# no "type" key, so they're treated as "single" too.
 for i, turn in enumerate(chat["display"]):
     st.markdown(f"**You:** {turn['question']}")
 
-    st.markdown("**Claude:**")
-    st.write(turn["claude"])
-    st.download_button(
-        "Download Claude's answer",
-        turn["claude"],
-        file_name=f"claude_answer_{i}.txt",
-        key=f"dl_claude_{i}",
-    )
+    if turn.get("type", "single") == "single":
+        st.markdown("**Claude:**")
+        st.write(turn["claude"])
+        st.download_button(
+            "Download Claude's answer",
+            turn["claude"],
+            file_name=f"claude_answer_{i}.txt",
+            key=f"dl_claude_{i}",
+        )
 
-    st.markdown("**ChatGPT's review:**")
-    st.write(turn["chatgpt"])
-    st.download_button(
-        "Download ChatGPT's review",
-        turn["chatgpt"],
-        file_name=f"chatgpt_review_{i}.txt",
-        key=f"dl_chatgpt_{i}",
-    )
+        st.markdown("**ChatGPT's review:**")
+        st.write(turn["chatgpt"])
+        st.download_button(
+            "Download ChatGPT's review",
+            turn["chatgpt"],
+            file_name=f"chatgpt_review_{i}.txt",
+            key=f"dl_chatgpt_{i}",
+        )
+    else:
+        for j, (speaker, reply) in enumerate(turn["transcript"]):
+            st.markdown(f"**{speaker} (round {j + 1}):**")
+            st.write(reply)
+            st.download_button(
+                f"Download round {j + 1} ({speaker})",
+                reply,
+                file_name=f"debate_{i}_round{j + 1}_{speaker.lower()}.txt",
+                key=f"dl_debate_{i}_{j}",
+            )
 
     st.divider()

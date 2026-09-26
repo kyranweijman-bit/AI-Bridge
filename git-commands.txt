@@ -1,0 +1,27 @@
+=== Every time I send you an updated file ===
+
+1. Open a terminal in the AI-Bridge folder (skip if already there):
+cd D:\AI-Bridge
+
+2. Save the change to GitHub:
+git add .
+git commit -m "Update"
+git push
+
+(You can change "Update" to anything describing what changed - it's just a label.)
+
+
+=== One-time setup (already done - just here for reference) ===
+
+git init
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/kyranweijman-bit/AI-Bridge.git
+git push -u origin main
+
+
+=== If git ever says "Please tell me who you are" ===
+
+git config --global user.email "kyran.weijman@gmail.com"
+git config --global user.name "Kyran"
