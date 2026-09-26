@@ -53,8 +53,12 @@ usage_totals = {
 
 def ask_claude(messages):
     response = claude.messages.create(
+        # 4096 instead of 800: newer Claude models spend part of this budget
+        # "thinking" before answering, and on a meaty question (reviewing a
+        # whole document, say) that thinking alone can eat the entire old
+        # 800-token cap, leaving nothing for the actual answer.
         model=CLAUDE_MODEL,
-        max_tokens=800,
+        max_tokens=4096,
         messages=messages,
     )
     usage_totals["claude_input_tokens"] += response.usage.input_tokens
@@ -67,7 +71,11 @@ def ask_claude(messages):
     for block in response.content:
         if block.type == "text":
             return block.text
-    return ""
+
+    # No text block at all - most likely max_tokens ran out mid-thought.
+    # Returning a visible message here instead of "" means this shows up
+    # clearly in the UI instead of looking like a silent, confusing blank.
+    return "[Claude gave no answer text - it likely ran out of its token budget while thinking. Try a shorter question, or raise max_tokens in bridge.py.]"
 
 
 def ask_chatgpt(messages):
@@ -125,52 +133,98 @@ def ask(question, target="claude"):
 
 
 def second_opinion(question, primary="claude"):
-    """One model answers, the other is shown the question + that answer and
-    asked to critique and improve it. `primary` picks who answers first -
-    "claude" (default) or "chatgpt"."""
+    """One model answers, the other is shown the same shared context plus
+    that answer, and asked to critique and improve it. `primary` picks who
+    answers first - "claude" (default) or "chatgpt".
+
+    Step 17: the reviewer gets `history` itself (the original question, any
+    earlier conversation, everything the first model saw) plus one short
+    instruction turn - not just a standalone question+answer pair - so its
+    critique is grounded in the same information the first model had."""
     first = ask(question, target=primary)
 
-    review_prompt = (
-        "Another AI answered the question below. "
-        "Point out mistakes or gaps, then give your own improved answer.\n\n"
-        f"Question: {question}\n\nAnswer:\n{first}"
-    )
+    reviewer_messages = history + [{
+        "role": "user",
+        "content": "Critique the answer above - point out mistakes or gaps - then give your own improved answer.",
+    }]
     reviewer = ask_chatgpt if primary == "claude" else ask_claude
-    second = reviewer([{"role": "user", "content": review_prompt}])
+    second = reviewer(reviewer_messages)
     return first, second
 
 
-def debate(question, rounds=3):
-    """Step 8: let the two models go back and forth instead of stopping
-    after one review. `rounds` is a hard cap on how many replies get
-    generated in total, so a run can never rack up an open-ended bill.
+# Step 18: named roles a debater can be assigned. Applied as an instruction
+# on every turn, so "Critic" actually behaves differently from "Proposer"
+# instead of just reacting generically.
+ROLE_INSTRUCTIONS = {
+    "Proposer": "Propose an answer or idea, building on the discussion so far.",
+    "Critic": "Critically challenge the previous statement - identify weaknesses, risks, or unstated assumptions.",
+    "Fact-checker": "Check the factual accuracy of the previous statement - flag anything questionable or incorrect, and correct it if you can.",
+}
 
-    Each model only sees the other's latest reply (not the whole shared
-    `history`), so this is a separate side conversation from `ask()` /
-    `second_opinion()` above."""
+
+def debate(question, rounds=3, claude_role="Proposer", chatgpt_role="Critic"):
+    """Let the two models go back and forth, each playing an assigned role.
+    `rounds` is a hard cap on how many replies get generated in total, so a
+    run can never rack up an open-ended bill.
+
+    Step 18: every round's message is rebuilt from scratch - the original
+    question (which includes any attachment text, since that's baked into
+    `question` before this is called), the full debate transcript so far,
+    and this speaker's role instruction - instead of only the last reply.
+    That keeps both models grounded in the same shared context turn to
+    turn rather than slowly drifting off it. This is still a separate side
+    conversation from `ask()` / `second_opinion()` above - it doesn't touch
+    the shared `history` list."""
+    roles = {"claude": claude_role, "chatgpt": chatgpt_role}
     transcript = []
     speaker = "claude"
-    message = question
 
     for i in range(rounds):
+        speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
+        role_instruction = ROLE_INSTRUCTIONS[roles[speaker]]
+
+        so_far = "\n\n".join(f"{name}: {reply}" for name, reply in transcript)
+        message = f"Question: {question}\n\n"
+        if so_far:
+            message += f"Debate so far:\n{so_far}\n\n"
+        message += f"Your role: {role_instruction}"
+
         if speaker == "claude":
             reply = ask_claude([{"role": "user", "content": message}])
-            speaker_name, next_speaker = "Claude", "chatgpt"
+            next_speaker = "chatgpt"
         else:
             reply = ask_chatgpt([{"role": "user", "content": message}])
-            speaker_name, next_speaker = "ChatGPT", "claude"
+            next_speaker = "claude"
 
         transcript.append((speaker_name, reply))
-        print(f"\n--- Round {i + 1}: {speaker_name} ---\n{reply}")
-
-        # Hand this reply to the other model as something to react to.
-        message = (
-            f"The other AI said:\n\n{reply}\n\n"
-            "Respond to it - agree, disagree, or add something new."
-        )
+        print(f"\n--- Round {i + 1}: {speaker_name} ({roles[speaker]}) ---\n{reply}")
         speaker = next_speaker
 
     return transcript
+
+
+def independent_answers(messages, question):
+    """Step 19: both models answer using the exact same shared context
+    (`messages` - the original question, any attachment, and the rest of
+    the conversation so far), without seeing each other's answer first, so
+    neither one's phrasing or assumptions can bias the other's. Afterward,
+    one model (Claude, here) is asked to compare the two independent
+    answers - where they agree, where they disagree, and which parts of
+    each seem more reliable."""
+    claude_answer = ask_claude(messages)
+    chatgpt_answer = ask_chatgpt(messages)
+
+    compare_prompt = (
+        "Two AI models independently answered the question below, without "
+        "seeing each other's response. Compare their answers: where do they "
+        "agree, where do they disagree, and which parts of each seem more "
+        "reliable?\n\n"
+        f"Question: {question}\n\n"
+        f"Model A (Claude):\n{claude_answer}\n\n"
+        f"Model B (ChatGPT):\n{chatgpt_answer}"
+    )
+    comparison = ask_claude([{"role": "user", "content": compare_prompt}])
+    return claude_answer, chatgpt_answer, comparison
 
 
 def save_history(path=HISTORY_FILE):

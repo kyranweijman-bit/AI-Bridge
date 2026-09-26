@@ -75,7 +75,7 @@ st.set_page_config(page_title="AI Bridge", layout="wide")
 if not check_password():
     st.stop()  # halts the script here - nothing below this line ever runs without the password
 
-from bridge import ask_claude, ask_chatgpt, debate, get_usage_summary
+from bridge import ask_claude, ask_chatgpt, debate, independent_answers, get_usage_summary
 from pypdf import PdfReader
 from docx import Document
 
@@ -212,10 +212,10 @@ st.title(chat["title"])
 uploaded_file = st.file_uploader("Attach a file (optional)")
 question = st.text_input("Ask a question")
 
-# Step 13/17: pick per-question how the two models are used.
+# Step 13/17/18/19: pick per-question how the two models are used.
 mode = st.radio(
     "Mode",
-    ["Single review", "Debate", "One model only"],
+    ["Single review", "Independent answers", "Debate", "One model only"],
     horizontal=True,
 )
 
@@ -224,7 +224,12 @@ if mode == "Single review":
     primary = st.radio("Who answers first?", ["Claude", "ChatGPT"], horizontal=True)
 elif mode == "Debate":
     rounds = st.slider("Rounds", min_value=1, max_value=6, value=3)
-else:
+    role_col1, role_col2 = st.columns(2)
+    with role_col1:
+        claude_role = st.selectbox("Claude's role", ["Proposer", "Critic", "Fact-checker"], index=0)
+    with role_col2:
+        chatgpt_role = st.selectbox("ChatGPT's role", ["Proposer", "Critic", "Fact-checker"], index=1)
+elif mode == "One model only":
     which_model = st.radio("Which model?", ["Claude", "ChatGPT"], horizontal=True)
 
 if st.button("Ask") and question:
@@ -238,6 +243,9 @@ if st.button("Ask") and question:
         prompt = f"The user attached a file named '{uploaded_file.name}':\n\n{text}\n\nQuestion: {question}"
 
     if mode == "Single review":
+        # Step 17: both models get the same shared context - see
+        # second_opinion()'s docstring in bridge.py for how the reviewer
+        # now sees the full history instead of just question+answer.
         chat["history"].append({"role": "user", "content": prompt})
 
         with st.spinner(f"Asking {primary}..."):
@@ -245,16 +253,12 @@ if st.button("Ask") and question:
         chat["history"].append({"role": "assistant", "content": first_answer})
 
         reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        review_prompt = (
-            "Another AI answered the question below. "
-            "Point out mistakes or gaps, then give your own improved answer.\n\n"
-            f"Question: {question}\n\nAnswer:\n{first_answer}"
-        )
+        reviewer_messages = chat["history"] + [{
+            "role": "user",
+            "content": "Critique the answer above - point out mistakes or gaps - then give your own improved answer.",
+        }]
         with st.spinner(f"Asking {reviewer} for a second opinion..."):
-            if reviewer == "ChatGPT":
-                second_answer = ask_chatgpt([{"role": "user", "content": review_prompt}])
-            else:
-                second_answer = ask_claude([{"role": "user", "content": review_prompt}])
+            second_answer = ask_chatgpt(reviewer_messages) if reviewer == "ChatGPT" else ask_claude(reviewer_messages)
 
         chat["display"].append({
             "type": "single",
@@ -264,17 +268,40 @@ if st.button("Ask") and question:
             "chatgpt": first_answer if primary == "ChatGPT" else second_answer,
         })
 
+    elif mode == "Independent answers":
+        chat["history"].append({"role": "user", "content": prompt})
+
+        with st.spinner("Claude and ChatGPT are answering independently..."):
+            claude_answer, chatgpt_answer, comparison = independent_answers(chat["history"], question)
+
+        # The comparison (which references both answers) becomes this turn's
+        # contribution to the shared history, so a follow-up question has a
+        # single coherent thing to build on rather than two raw answers.
+        chat["history"].append({"role": "assistant", "content": comparison})
+
+        chat["display"].append({
+            "type": "independent",
+            "question": question,
+            "claude": claude_answer,
+            "chatgpt": chatgpt_answer,
+            "comparison": comparison,
+        })
+
     elif mode == "Debate":
         # debate() doesn't touch chat["history"] - it's its own separate
         # side conversation between the two models, not part of the
-        # ongoing shared context used for follow-up questions.
+        # ongoing shared context used for follow-up questions. It does
+        # rebuild the full debate transcript + original question every
+        # round internally - see bridge.py.
         with st.spinner("Claude and ChatGPT are going back and forth..."):
-            transcript = debate(prompt, rounds=rounds)
+            transcript = debate(prompt, rounds=rounds, claude_role=claude_role, chatgpt_role=chatgpt_role)
 
         chat["display"].append({
             "type": "debate",
             "question": question,
             "transcript": transcript,
+            "claude_role": claude_role,
+            "chatgpt_role": chatgpt_role,
         })
 
     else:  # One model only
@@ -309,10 +336,10 @@ for i, turn in enumerate(chat["display"]):
 
     if turn_type == "single":
         primary = turn.get("primary", "Claude")  # chats saved before this existed default to Claude-first
-        claude_role = "answered first" if primary == "Claude" else "reviewed"
-        chatgpt_role = "answered first" if primary == "ChatGPT" else "reviewed"
+        claude_label = "answered first" if primary == "Claude" else "reviewed"
+        chatgpt_label = "answered first" if primary == "ChatGPT" else "reviewed"
 
-        st.markdown(f"**Claude** ({claude_role}):")
+        st.markdown(f"**Claude** ({claude_label}):")
         st.write(turn["claude"])
         st.download_button(
             "Download Claude's answer",
@@ -321,13 +348,41 @@ for i, turn in enumerate(chat["display"]):
             key=f"dl_claude_{i}",
         )
 
-        st.markdown(f"**ChatGPT** ({chatgpt_role}):")
+        st.markdown(f"**ChatGPT** ({chatgpt_label}):")
         st.write(turn["chatgpt"])
         st.download_button(
             "Download ChatGPT's answer",
             turn["chatgpt"],
             file_name=f"chatgpt_answer_{i}.txt",
             key=f"dl_chatgpt_{i}",
+        )
+
+    elif turn_type == "independent":
+        st.markdown("**Claude** (answered independently):")
+        st.write(turn["claude"])
+        st.download_button(
+            "Download Claude's answer",
+            turn["claude"],
+            file_name=f"claude_answer_{i}.txt",
+            key=f"dl_ind_claude_{i}",
+        )
+
+        st.markdown("**ChatGPT** (answered independently):")
+        st.write(turn["chatgpt"])
+        st.download_button(
+            "Download ChatGPT's answer",
+            turn["chatgpt"],
+            file_name=f"chatgpt_answer_{i}.txt",
+            key=f"dl_ind_chatgpt_{i}",
+        )
+
+        st.markdown("**Comparison:**")
+        st.write(turn["comparison"])
+        st.download_button(
+            "Download comparison",
+            turn["comparison"],
+            file_name=f"comparison_{i}.txt",
+            key=f"dl_ind_compare_{i}",
         )
 
     elif turn_type == "solo":
@@ -342,7 +397,9 @@ for i, turn in enumerate(chat["display"]):
 
     else:  # debate
         for j, (speaker, reply) in enumerate(turn["transcript"]):
-            st.markdown(f"**{speaker} (round {j + 1}):**")
+            role = turn.get("claude_role") if speaker == "Claude" else turn.get("chatgpt_role")
+            role_label = f", {role}" if role else ""
+            st.markdown(f"**{speaker} (round {j + 1}{role_label}):**")
             st.write(reply)
             st.download_button(
                 f"Download round {j + 1} ({speaker})",
