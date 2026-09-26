@@ -34,7 +34,14 @@ def ask_claude(messages):
         max_tokens=800,
         messages=messages,
     )
-    return response.content[0].text
+    # Newer Claude models sometimes "think" before answering, which shows up
+    # as an extra ThinkingBlock ahead of the actual answer in response.content.
+    # So we look for the text block specifically, instead of assuming it's
+    # always content[0].
+    for block in response.content:
+        if block.type == "text":
+            return block.text
+    return ""
 
 
 def ask_chatgpt(messages):
