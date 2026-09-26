@@ -27,6 +27,29 @@ HISTORY_FILE = "history.json"
 # that both models get sent, so they're both "seeing" the same conversation.
 history = []
 
+# Step 14: cost visibility. $ per million tokens, input/output, for models
+# actually used here. Pricing changes over time and this isn't fetched live,
+# so treat it as a good-faith estimate - check the providers' own pricing
+# pages if you need an exact figure. Model names not listed here still work
+# fine to ask questions, they just won't have a cost estimate shown.
+PRICING = {
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-opus-5": {"input": 4.00, "output": 20.00},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+    "claude-fable-5-1": {"input": 10.00, "output": 50.00},
+    "gpt-5.4": {"input": 2.50, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.25, "output": 2.00},
+    "gpt-5.5": {"input": 5.00, "output": 30.00},
+}
+
+# Running totals for this process's lifetime - resets when the app restarts.
+usage_totals = {
+    "claude_input_tokens": 0,
+    "claude_output_tokens": 0,
+    "openai_input_tokens": 0,
+    "openai_output_tokens": 0,
+}
+
 
 def ask_claude(messages):
     response = claude.messages.create(
@@ -34,6 +57,9 @@ def ask_claude(messages):
         max_tokens=800,
         messages=messages,
     )
+    usage_totals["claude_input_tokens"] += response.usage.input_tokens
+    usage_totals["claude_output_tokens"] += response.usage.output_tokens
+
     # Newer Claude models sometimes "think" before answering, which shows up
     # as an extra ThinkingBlock ahead of the actual answer in response.content.
     # So we look for the text block specifically, instead of assuming it's
@@ -49,7 +75,44 @@ def ask_chatgpt(messages):
         model=OPENAI_MODEL,
         messages=messages,
     )
+    usage_totals["openai_input_tokens"] += response.usage.prompt_tokens
+    usage_totals["openai_output_tokens"] += response.usage.completion_tokens
+
     return response.choices[0].message.content
+
+
+def _cost(model_name, input_tokens, output_tokens):
+    """Returns an estimated $ cost, or None if this model isn't in PRICING."""
+    rates = PRICING.get(model_name)
+    if rates is None:
+        return None
+    return (input_tokens / 1_000_000) * rates["input"] + (output_tokens / 1_000_000) * rates["output"]
+
+
+def get_usage_summary():
+    """Returns a dict with token counts and estimated $ cost so far, for
+    each model, plus a combined total. Cost is None for an unrecognized
+    model instead of silently showing $0."""
+    claude_cost = _cost(CLAUDE_MODEL, usage_totals["claude_input_tokens"], usage_totals["claude_output_tokens"])
+    openai_cost = _cost(OPENAI_MODEL, usage_totals["openai_input_tokens"], usage_totals["openai_output_tokens"])
+
+    total_cost = None
+    if claude_cost is not None or openai_cost is not None:
+        total_cost = (claude_cost or 0) + (openai_cost or 0)
+
+    return {
+        "claude": {
+            "input_tokens": usage_totals["claude_input_tokens"],
+            "output_tokens": usage_totals["claude_output_tokens"],
+            "cost": claude_cost,
+        },
+        "openai": {
+            "input_tokens": usage_totals["openai_input_tokens"],
+            "output_tokens": usage_totals["openai_output_tokens"],
+            "cost": openai_cost,
+        },
+        "total_cost": total_cost,
+    }
 
 
 def ask(question, target="claude"):
@@ -61,18 +124,19 @@ def ask(question, target="claude"):
     return answer
 
 
-def second_opinion(question):
-    """Claude answers, then ChatGPT is shown the question + Claude's answer
-    and asked to critique and improve it. Swap the two calls below if you
-    want ChatGPT to answer first instead."""
-    first = ask(question, target="claude")
+def second_opinion(question, primary="claude"):
+    """One model answers, the other is shown the question + that answer and
+    asked to critique and improve it. `primary` picks who answers first -
+    "claude" (default) or "chatgpt"."""
+    first = ask(question, target=primary)
 
     review_prompt = (
         "Another AI answered the question below. "
         "Point out mistakes or gaps, then give your own improved answer.\n\n"
         f"Question: {question}\n\nAnswer:\n{first}"
     )
-    second = ask_chatgpt([{"role": "user", "content": review_prompt}])
+    reviewer = ask_chatgpt if primary == "claude" else ask_claude
+    second = reviewer([{"role": "user", "content": review_prompt}])
     return first, second
 
 
