@@ -13,6 +13,7 @@ future features like searching past chats, per-model statistics and
 branching conversations simple queries.
 """
 
+import atexit
 import os
 import re
 import uuid
@@ -51,6 +52,18 @@ def _get_pool():
             kwargs={"autocommit": True, "prepare_threshold": None, "row_factory": dict_row},
         )
     return _pool
+
+
+def close():
+    """Close the connection pool. Called automatically when Python exits,
+    so scripts end cleanly instead of printing a shutdown error."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+atexit.register(close)
 
 
 def _query(sql, params=None):
