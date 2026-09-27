@@ -84,19 +84,64 @@ CUTOFF_NOTE = "\n\n[Answer cut off - it ran out of its token budget. Consider ra
 # Claude takes it as a separate `system` parameter; OpenAI as a first
 # message with role "system".
 
-def _claude_kwargs(messages, system):
-    kwargs = {"model": CLAUDE_MODEL, "max_tokens": MAX_TOKENS, "messages": messages}
+# ---- Image input: one neutral content format, adapted per provider ----
+#
+# A message's `content` is normally just a string. When an image is
+# attached, app.py instead builds it as a small list of blocks in this
+# app's own neutral shape - {"type": "text", "text": ...} or {"type":
+# "image", "media_type": ..., "data": <base64>} - so the same shared
+# `history` still works for both providers (the whole point of this app).
+# Claude and OpenAI each want that image wrapped differently, so these two
+# adapters translate it right before the request goes out; a plain string
+# message passes through untouched.
+
+def _to_claude_messages(messages):
+    out = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append(m)
+            continue
+        blocks = []
+        for b in content:
+            if b["type"] == "image":
+                blocks.append({"type": "image", "source": {"type": "base64", "media_type": b["media_type"], "data": b["data"]}})
+            else:
+                blocks.append({"type": "text", "text": b["text"]})
+        out.append({"role": m["role"], "content": blocks})
+    return out
+
+
+def _to_openai_messages(messages):
+    out = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append(m)
+            continue
+        blocks = []
+        for b in content:
+            if b["type"] == "image":
+                blocks.append({"type": "image_url", "image_url": {"url": f"data:{b['media_type']};base64,{b['data']}"}})
+            else:
+                blocks.append({"type": "text", "text": b["text"]})
+        out.append({"role": m["role"], "content": blocks})
+    return out
+
+
+def _claude_kwargs(messages, system, max_tokens):
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": max_tokens or MAX_TOKENS, "messages": _to_claude_messages(messages)}
     if system:
         kwargs["system"] = system
     return kwargs
 
 
 def _openai_messages(messages, system):
-    return ([{"role": "system", "content": system}] if system else []) + list(messages)
+    return ([{"role": "system", "content": system}] if system else []) + _to_openai_messages(messages)
 
 
-def ask_claude(messages, system=None):
-    response = claude.messages.create(**_claude_kwargs(messages, system))
+def ask_claude(messages, system=None, max_tokens=None):
+    response = claude.messages.create(**_claude_kwargs(messages, system, max_tokens))
     usage_totals["claude_input_tokens"] += response.usage.input_tokens
     usage_totals["claude_output_tokens"] += response.usage.output_tokens
     _record_usage("anthropic", CLAUDE_MODEL, response.usage.input_tokens, response.usage.output_tokens)
@@ -123,11 +168,11 @@ def ask_claude(messages, system=None):
     return "[Claude gave no answer text - it ran out of its token budget while thinking. Try a shorter question, or raise MAX_TOKENS in bridge.py.]"
 
 
-def ask_chatgpt(messages, system=None):
+def ask_chatgpt(messages, system=None, max_tokens=None):
     response = chatgpt.chat.completions.create(
         model=OPENAI_MODEL,
         messages=_openai_messages(messages, system),
-        max_completion_tokens=MAX_TOKENS,
+        max_completion_tokens=max_tokens or MAX_TOKENS,
     )
     usage_totals["openai_input_tokens"] += response.usage.prompt_tokens
     usage_totals["openai_output_tokens"] += response.usage.completion_tokens
@@ -149,8 +194,8 @@ def ask_chatgpt(messages, system=None):
 # Streaming doesn't use more tokens or cost more - it's the exact same
 # request, just delivered progressively instead of in one lump.
 
-def ask_claude_stream(messages, system=None):
-    with claude.messages.stream(**_claude_kwargs(messages, system)) as stream:
+def ask_claude_stream(messages, system=None, max_tokens=None):
+    with claude.messages.stream(**_claude_kwargs(messages, system, max_tokens)) as stream:
         # .text_stream yields only the actual answer text, skipping over any
         # "thinking" content - same underlying distinction as the ThinkingBlock
         # check in ask_claude() above, just handled by the SDK during streaming.
@@ -166,12 +211,12 @@ def ask_claude_stream(messages, system=None):
             yield CUTOFF_NOTE
 
 
-def ask_chatgpt_stream(messages, system=None):
+def ask_chatgpt_stream(messages, system=None, max_tokens=None):
     finish_reason = None
     stream = chatgpt.chat.completions.create(
         model=OPENAI_MODEL,
         messages=_openai_messages(messages, system),
-        max_completion_tokens=MAX_TOKENS,
+        max_completion_tokens=max_tokens or MAX_TOKENS,
         stream=True,
         stream_options={"include_usage": True},  # asks for a final usage-only chunk
     )
@@ -421,6 +466,35 @@ PROMPT_PRESETS = {
     },
 }
 
+
+# ---- Depth control: one toggle instead of setting mode + rounds + token
+# budget separately. Each preset bounds the work (and cost) it can do - a
+# "Quick check" can never accidentally turn into a long, expensive debate.
+DEPTH_PRESETS = {
+    "Quick check": {
+        "mode": "One model only", "which_model": "Claude", "max_tokens": 1024,
+    },
+    "Thorough review": {
+        "mode": "Single review", "primary": "Claude", "max_tokens": 4096,
+    },
+    "Deep debate": {
+        "mode": "Debate", "rounds": 4, "claude_role": "Proposer", "chatgpt_role": "Critic",
+        "max_tokens": 8192,
+    },
+}
+
+
+# ---- Confidence tags: each model marks its own claims, instead of every
+# sentence reading equally certain. This does NOT try to line up "the same
+# claim" across both models (that's a harder job - see the roadmap's
+# Disagreement map idea) - it's each model's own honesty about itself,
+# shown with a bit of color so a "[guessing]" tag actually stands out.
+CONFIDENCE_TAG_INSTRUCTION = (
+    "For each substantive claim you make, tag it inline right after the "
+    "claim with exactly one of: [sure], [fairly sure], or [guessing] - "
+    "reflecting your actual confidence, not just to fill in the tag."
+)
+
 # The "Draft -> Critique -> Revise -> Final check" recipe from the roadmap:
 # a fixed chain of steps, each one model speaking in turn, every step seeing
 # the original question plus the full chain so far (same shared-context
@@ -452,6 +526,119 @@ def run_recipe(question):
         transcript.append((speaker_name, reply))
         labeled_transcript.append((speaker_name, label, reply))
     return labeled_transcript
+
+
+# ---- Smarter collaboration batch (27 Sept 2026) ----
+#
+# All of these are just more prompt-building helpers and small instruction
+# strings, in the same spirit as CONCLUSION_INSTRUCTION / REVIEW_INSTRUCTION
+# above - app.py wires each one into an optional toggle or a quick-action
+# button. None of them need new infrastructure.
+
+DISAGREEMENT_MAP_INSTRUCTION = (
+    "Analyze the discussion above for disagreement between the two models. "
+    "First, score the overall level of agreement in one line: fully agree "
+    "/ mostly agree / partially disagree / fundamentally disagree. Then "
+    "list the specific points where they clash, and for each one classify "
+    "*why*: different facts, different assumptions, different priorities, "
+    "or different interpretations - since each kind needs a different "
+    "resolution."
+)
+
+
+def build_disagreement_map_prompt(question, discussion_text):
+    return f"Question: {question}\n\nDiscussion so far:\n{discussion_text}\n\n{DISAGREEMENT_MAP_INSTRUCTION}"
+
+
+CHALLENGE_ASSUMPTIONS_INSTRUCTION = (
+    "Before anyone answers, point out any questionable assumptions in the "
+    "question below - including ones you suspect most people would share "
+    "without noticing. If there's truly nothing worth flagging, say so in "
+    "one line. Do not answer the question itself here."
+)
+
+
+def build_challenge_assumptions_prompt(question):
+    return f"Question: {question}\n\n{CHALLENGE_ASSUMPTIONS_INSTRUCTION}"
+
+
+# "Ask before debating": a quick check before round 1 - either a clarifying
+# question or this exact phrase, matched case-insensitively so app.py can
+# tell whether to pause for an answer or just carry straight on.
+NO_CLARIFICATION_NEEDED = "no clarifying questions needed"
+
+CLARIFY_INSTRUCTION = (
+    "Before debating the question below, decide whether one important "
+    "detail is missing that would change the answer. If so, ask exactly "
+    "one or two clarifying questions and nothing else. If not, reply with "
+    f"exactly: {NO_CLARIFICATION_NEEDED.capitalize()}."
+)
+
+
+def build_clarify_prompt(question):
+    return f"Question: {question}\n\n{CLARIFY_INSTRUCTION}"
+
+
+# "Adaptive debate length": a cheap yes/no check run after each round once
+# there's enough transcript to judge. Kept to a one-word answer so it's a
+# small, fast call - the caller (app.py) matches "YES" case-insensitively.
+STALL_CHECK_INSTRUCTION = (
+    "Compare these two most recent replies from a debate. Have they "
+    "stopped adding meaningfully new information - i.e. are they mostly "
+    "repeating earlier points rather than advancing the discussion? "
+    "Reply with exactly one word: YES or NO."
+)
+
+CONSENSUS_CHECK_INSTRUCTION = (
+    "Look at this debate transcript so far. Have both sides now converged "
+    "on a shared conclusion they'd both sign off on? Reply with exactly "
+    "one word: YES or NO."
+)
+
+
+def build_stall_check_prompt(last_two_replies_text):
+    return f"{last_two_replies_text}\n\n{STALL_CHECK_INSTRUCTION}"
+
+
+def build_consensus_check_prompt(transcript_text):
+    return f"{transcript_text}\n\n{CONSENSUS_CHECK_INSTRUCTION}"
+
+
+# "Steelmanning": appended to a debater's role instruction from round 2
+# onward (round 1 has nothing yet to steelman).
+STEELMAN_INSTRUCTION = (
+    "Before responding, first restate the other side's most recent point "
+    "fairly and accurately in your own words - a real steelman, not a "
+    "caricature - then give your response."
+)
+
+# "Tests instead of opinions": an optional addition to the system prompt,
+# same mechanism as CONFIDENCE_TAG_INSTRUCTION.
+TESTS_NOT_OPINIONS_INSTRUCTION = (
+    "Where the question is checkable - by a calculation, an experiment, "
+    "or a small test - propose that test explicitly rather than just "
+    "asserting an opinion."
+)
+
+# "More roles and personas": one more fixed role alongside Proposer/Critic/
+# Fact-checker. Custom, user-saved personas (a name + a free-text
+# instruction) are stored in the database (db.py's personas table) and
+# merged into the same role-instruction lookup by app.py at ask-time.
+ROLE_INSTRUCTIONS["Devil's advocate"] = (
+    "Argue against the previous statement no matter how good it is - your "
+    "job is to find the strongest possible objection, not to be balanced."
+)
+
+THIRD_OPTION_INSTRUCTION = (
+    "Looking at the discussion above, the models have likely converged on "
+    "(or you can see) two obvious choices. Propose a materially different "
+    "third option that still meets the original requirements - not a "
+    "compromise between the two, a genuinely different approach."
+)
+
+
+def build_third_option_prompt(question, discussion_text):
+    return f"Question: {question}\n\nDiscussion so far:\n{discussion_text}\n\n{THIRD_OPTION_INSTRUCTION}"
 
 
 def save_history(path=HISTORY_FILE):

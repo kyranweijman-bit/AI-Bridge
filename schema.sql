@@ -68,6 +68,61 @@ create table if not exists files (
     created_at      timestamptz not null default now()
 );
 
+-- Small app-wide settings, one row per key - just the spending limit for
+-- now. A key-value table instead of a dedicated column since this is meant
+-- to grow (more app-wide toggles later) without another migration each time.
+create table if not exists settings (
+    key         text primary key,
+    value       text not null,
+    updated_at  timestamptz not null default now()
+);
+
+-- Blind-judging votes (quick win): which answer someone preferred before
+-- the model names were revealed, for Independent Answers turns asked with
+-- that toggle on. Also kept around for the model-vs-model stats dashboard
+-- further down the roadmap, once that gets built.
+create table if not exists votes (
+    id          bigserial primary key,
+    chat_id     uuid not null references chats(id) on delete cascade,
+    turn_index  int not null,
+    winner      text not null,          -- Claude | ChatGPT | Tie
+    created_at  timestamptz not null default now()
+);
+
+-- Saveable personas (more roles and personas quick idea): a name plus a
+-- free-text instruction, assignable to either model's debate role
+-- alongside the fixed Proposer/Critic/Fact-checker/Devil's advocate ones.
+create table if not exists personas (
+    id           bigserial primary key,
+    name         text not null unique,
+    instruction  text not null,
+    created_at   timestamptz not null default now()
+);
+
+-- Editable working brief: one per chat - a standing summary of the goal,
+-- constraints, decisions and open questions, sent to both models on every
+-- call in that chat (like memory, but a single editable block rather than
+-- a growing list of notes).
+create table if not exists briefs (
+    chat_id     uuid primary key references chats(id) on delete cascade,
+    content     text not null,
+    updated_at  timestamptz not null default now()
+);
+
+-- Decision journal: what you chose, why, and (filled in later) what
+-- actually happened - so real outcomes can eventually be compared against
+-- the advice that led to them.
+create table if not exists decisions (
+    id          bigserial primary key,
+    chat_id     uuid not null references chats(id) on delete cascade,
+    turn_index  int not null,
+    choice      text not null,
+    reasoning   text,
+    outcome     text,                 -- filled in later, once you know what happened
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+
 -- Supabase also exposes every table through a public web API. Turning on
 -- row-level security with no policies blocks that route completely, while
 -- the app (which connects directly as the database owner) is unaffected.
@@ -76,3 +131,8 @@ alter table messages  enable row level security;
 alter table memories  enable row level security;
 alter table usage_log enable row level security;
 alter table files     enable row level security;
+alter table settings  enable row level security;
+alter table votes     enable row level security;
+alter table personas  enable row level security;
+alter table briefs    enable row level security;
+alter table decisions enable row level security;

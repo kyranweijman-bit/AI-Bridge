@@ -106,6 +106,37 @@ def set_pinned(chat_id, pinned):
     _query("update chats set pinned = %s where id = %s", (pinned, chat_id))
 
 
+def branch_chat(source_chat_id, up_to_turn_index, new_title=None):
+    """Branching conversations: fork a chat at any message. Copies every
+    message and file row with turn_index <= up_to_turn_index into a brand
+    new chat, so the two chats can then diverge independently - the
+    original is completely untouched. Returns the new chat's id."""
+    source_rows = _query("select title from chats where id = %s", (source_chat_id,))
+    source_title = source_rows[0]["title"] if source_rows else "Chat"
+    title = new_title or f"{source_title} (branch)"
+
+    new_id = str(uuid.uuid4())
+    with _get_pool().connection() as conn:
+        with conn.transaction():
+            conn.execute("insert into chats (id, title) values (%s, %s)", (new_id, title))
+            conn.execute(
+                """insert into messages
+                   (chat_id, turn_index, mode, kind, model, role, round,
+                    content, context, in_context, meta)
+                   select %s, turn_index, mode, kind, model, role, round,
+                          content, context, in_context, meta
+                   from messages where chat_id = %s and turn_index <= %s""",
+                (new_id, source_chat_id, up_to_turn_index),
+            )
+            conn.execute(
+                """insert into files (chat_id, turn_index, filename, storage_path, extracted_text)
+                   select %s, turn_index, filename, storage_path, extracted_text
+                   from files where chat_id = %s and turn_index <= %s""",
+                (new_id, source_chat_id, up_to_turn_index),
+            )
+    return new_id
+
+
 def load_chat(chat_id):
     """Returns {"title", "pinned", "history", "display"} in the same shape the
     app used with JSON files, or None if the chat doesn't exist (anymore).
@@ -210,6 +241,23 @@ def _rows_to_turn(rows):
     if conclusion is not None:
         result["conclusion"] = conclusion
 
+    # Same pattern as conclusion above: a disagreement map or a third-option
+    # suggestion, if one was generated for this turn by its button.
+    disagreement_map = next((r["content"] for r in rows if r["kind"] == "disagreement_map"), None)
+    if disagreement_map is not None:
+        result["disagreement_map"] = disagreement_map
+
+    third_option = next((r["content"] for r in rows if r["kind"] == "third_option"), None)
+    if third_option is not None:
+        result["third_option"] = third_option
+
+    # Quick wins: confidence tags / blind judging were on for this turn -
+    # carried in `meta` (see _turn_to_rows) since both apply regardless of mode.
+    if meta.get("confidence_tags"):
+        result["confidence_tags"] = True
+    if meta.get("blind_judging"):
+        result["blind_judging"] = True
+
     return result
 
 
@@ -239,6 +287,15 @@ def _turn_to_rows(turn, prompt=None):
     mode = turn.get("type", "single")
     context = prompt if prompt and prompt != turn["question"] else None
     q = {"mode": mode, "kind": "question", "content": turn["question"], "context": context}
+    # Quick wins: confidence tags and blind judging both apply regardless of
+    # mode, so they ride in the question row's `meta` alongside whatever
+    # mode-specific meta each branch below already builds (read back in
+    # _rows_to_turn above).
+    extra_meta = {}
+    if turn.get("confidence_tags"):
+        extra_meta["confidence_tags"] = True
+    if turn.get("blind_judging"):
+        extra_meta["blind_judging"] = True
 
     if mode == "single":
         primary = turn.get("primary", "Claude")
@@ -246,14 +303,14 @@ def _turn_to_rows(turn, prompt=None):
         first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
         second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
         return [
-            {**q, "in_context": True, "meta": {"primary": primary}},
+            {**q, "in_context": True, "meta": {"primary": primary, **extra_meta}},
             {"mode": mode, "kind": "answer", "model": primary, "content": first, "in_context": True},
             {"mode": mode, "kind": "review", "model": reviewer, "content": second},
         ]
 
     if mode == "independent":
         return [
-            {**q, "in_context": True},
+            {**q, "in_context": True, "meta": extra_meta},
             {"mode": mode, "kind": "answer", "model": "Claude", "content": turn["claude"]},
             {"mode": mode, "kind": "answer", "model": "ChatGPT", "content": turn["chatgpt"]},
             {"mode": mode, "kind": "comparison", "model": "Claude", "content": turn["comparison"], "in_context": True},
@@ -261,21 +318,21 @@ def _turn_to_rows(turn, prompt=None):
 
     if mode == "debate":
         roles = {"Claude": turn.get("claude_role"), "ChatGPT": turn.get("chatgpt_role")}
-        rows = [{**q, "meta": {"claude_role": roles["Claude"], "chatgpt_role": roles["ChatGPT"]}}]
+        rows = [{**q, "meta": {"claude_role": roles["Claude"], "chatgpt_role": roles["ChatGPT"], **extra_meta}}]
         for i, (speaker, reply) in enumerate(turn["transcript"]):
             rows.append({"mode": mode, "kind": "debate", "model": speaker,
                          "role": roles.get(speaker), "round": i + 1, "content": reply})
         return rows
 
     if mode == "recipe":
-        rows = [{**q}]
+        rows = [{**q, "meta": extra_meta}]
         for i, (speaker, label, reply) in enumerate(turn["transcript"]):
             rows.append({"mode": mode, "kind": "recipe", "model": speaker,
                          "role": label, "round": i + 1, "content": reply})
         return rows
 
     return [
-        {**q, "in_context": True, "meta": {"model": turn["model"]}},
+        {**q, "in_context": True, "meta": {"model": turn["model"], **extra_meta}},
         {"mode": mode, "kind": "answer", "model": turn["model"], "content": turn["answer"], "in_context": True},
     ]
 
@@ -339,6 +396,10 @@ def export_chat_text(chat_id):
 
         if turn.get("conclusion"):
             lines += ["**Conclusion:**", turn["conclusion"], ""]
+        if turn.get("disagreement_map"):
+            lines += ["**Disagreement map:**", turn["disagreement_map"], ""]
+        if turn.get("third_option"):
+            lines += ["**A third option:**", turn["third_option"], ""]
 
         lines.append("---")
         lines.append("")
@@ -388,6 +449,105 @@ def memory_prompt(chat_id=None):
         "The user has asked you to keep the following in mind in this "
         f"conversation:\n{lines}"
     )
+
+
+# ---- Settings (spending limit) ----
+
+def get_setting(key, default=None):
+    rows = _query("select value from settings where key = %s", (key,))
+    return rows[0]["value"] if rows else default
+
+
+def set_setting(key, value):
+    _query(
+        """insert into settings (key, value) values (%s, %s)
+           on conflict (key) do update set value = excluded.value, updated_at = now()""",
+        (key, value),
+    )
+
+
+# ---- Blind-judging votes ----
+
+def add_vote(chat_id, turn_index, winner):
+    _query(
+        "insert into votes (chat_id, turn_index, winner) values (%s, %s, %s)",
+        (chat_id, turn_index, winner),
+    )
+
+
+def get_vote(chat_id, turn_index):
+    """The winner already recorded for this turn, or None if nobody's voted
+    yet - used to decide whether to still show it blind or reveal it."""
+    rows = _query(
+        "select winner from votes where chat_id = %s and turn_index = %s order by id desc limit 1",
+        (chat_id, turn_index),
+    )
+    return rows[0]["winner"] if rows else None
+
+
+def vote_stats():
+    """Model-vs-model stats dashboard: overall blind-judging win counts.
+    Per-topic breakdown isn't built yet - that needs a way to classify what
+    each question was about first."""
+    rows = _query("select winner, count(*) as n from votes group by winner order by n desc")
+    return {r["winner"]: int(r["n"]) for r in rows}
+
+
+# ---- Saveable personas ----
+
+def list_personas():
+    return _query("select id, name, instruction from personas order by name")
+
+
+def add_persona(name, instruction):
+    _query(
+        """insert into personas (name, instruction) values (%s, %s)
+           on conflict (name) do update set instruction = excluded.instruction""",
+        (name.strip(), instruction.strip()),
+    )
+
+
+def delete_persona(persona_id):
+    _query("delete from personas where id = %s", (persona_id,))
+
+
+# ---- Editable working brief ----
+
+def get_brief(chat_id):
+    rows = _query("select content from briefs where chat_id = %s", (chat_id,))
+    return rows[0]["content"] if rows else ""
+
+
+def set_brief(chat_id, content):
+    content = content.strip()
+    if not content:
+        _query("delete from briefs where chat_id = %s", (chat_id,))
+        return
+    _query(
+        """insert into briefs (chat_id, content) values (%s, %s)
+           on conflict (chat_id) do update set content = excluded.content, updated_at = now()""",
+        (chat_id, content),
+    )
+
+
+# ---- Decision journal ----
+
+def add_decision(chat_id, turn_index, choice, reasoning=""):
+    _query(
+        "insert into decisions (chat_id, turn_index, choice, reasoning) values (%s, %s, %s, %s)",
+        (chat_id, turn_index, choice, reasoning),
+    )
+
+
+def list_decisions(chat_id=None):
+    """All decisions, or just one chat's - newest first."""
+    if chat_id is None:
+        return _query("select d.*, c.title from decisions d join chats c on c.id = d.chat_id order by d.created_at desc")
+    return _query("select * from decisions where chat_id = %s order by created_at desc", (chat_id,))
+
+
+def set_decision_outcome(decision_id, outcome):
+    _query("update decisions set outcome = %s, updated_at = now() where id = %s", (outcome, decision_id))
 
 
 # ---- Usage ----
