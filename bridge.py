@@ -8,6 +8,7 @@ Claude answers first, then ChatGPT is asked to review and improve on it.
 
 import os
 import json
+import re
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from openai import OpenAI
@@ -639,6 +640,90 @@ THIRD_OPTION_INSTRUCTION = (
 
 def build_third_option_prompt(question, discussion_text):
     return f"Question: {question}\n\nDiscussion so far:\n{discussion_text}\n\n{THIRD_OPTION_INSTRUCTION}"
+
+
+# ---- Edit my file(s), and let me download them again ----
+#
+# Normally an attached file's text is just context - the model discusses it,
+# it doesn't hand back a new file. This is an opt-in addition (app.py's
+# file_edit_mode checkbox) that asks for the actual edited content of every
+# attached file back, each one marked off clearly enough that app.py can pull
+# it back out of the answer - even if the model also wants to briefly explain
+# what it changed first, and even with several files attached at once.
+FILE_EDIT_MARKER_PREFIX = "---EDITED FILE:"
+FILE_EDIT_MARKER_SUFFIX = "---"
+
+
+def build_file_edit_instruction(filenames):
+    """filenames: the attached (non-image) files' names, in the order they
+    were attached. One filename gets the simpler single-file wording;
+    several get one marker line per file so each can be told apart."""
+    if len(filenames) == 1:
+        marker = f"{FILE_EDIT_MARKER_PREFIX} {filenames[0]} {FILE_EDIT_MARKER_SUFFIX}"
+        return (
+            "The user wants an edited/corrected version of the attached file "
+            "back, not just a discussion of it. Make the changes the user "
+            "asked for to the full content of the attached file. If you want "
+            "to briefly explain what you changed, do that first, then output "
+            f"the line '{marker}' by itself, followed by the complete "
+            "revised file content and nothing else - no closing remarks, no "
+            "markdown code fences, just the file's full text exactly as it "
+            "should be saved."
+        )
+    names = ", ".join(filenames)
+    return (
+        "The user wants edited/corrected versions of the attached files "
+        f"back, not just a discussion of them. Make the changes the user "
+        f"asked for to each of these {len(filenames)} attached files: "
+        f"{names}. If you want to briefly explain your changes, do that "
+        "first. Then, for EACH of the files listed above - whether or not "
+        f"you actually changed it - output a line of the exact form "
+        f"'{FILE_EDIT_MARKER_PREFIX} <filename> {FILE_EDIT_MARKER_SUFFIX}' "
+        "(using its exact filename) followed immediately by that file's "
+        "complete content, one file after another in that same order. No "
+        "closing remarks, no markdown code fences anywhere - just each "
+        "marker line and then that file's full text exactly as it should "
+        "be saved."
+    )
+
+
+_FILE_EDIT_PATTERN = re.compile(
+    r"---EDITED FILE:\s*(.+?)\s*---\s*\n(.*?)(?=\n---EDITED FILE:|\Z)",
+    re.DOTALL,
+)
+
+
+def _strip_code_fence(content):
+    content = content.strip()
+    if content.startswith("```"):
+        lines = content.split("\n")
+        lines = lines[1:]  # drop the opening fence (with its optional language tag)
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines)
+    return content
+
+
+def extract_edited_files(answer_text, filenames):
+    """Splits an answer built with build_file_edit_instruction() back into
+    {filename: edited_text} - one entry per attached filename the model
+    marked, in whatever order they appeared. Falls back to treating the
+    WHOLE answer as the (only) file's content when there's exactly one
+    attached file and no marker shows up at all (some models skip the
+    marker on a single-file request despite being asked for it)."""
+    results = {}
+    for raw_name, content in _FILE_EDIT_PATTERN.findall(answer_text):
+        name = raw_name.strip()
+        # Match the exact attached filename if the model paraphrased it
+        # slightly (extra quotes, a leading "./", ...); otherwise keep
+        # whatever it wrote so nothing silently vanishes.
+        matched_name = next((f for f in filenames if f == name or f.strip("./") == name.strip("./")), name)
+        results[matched_name] = _strip_code_fence(content)
+
+    if not results and len(filenames) == 1:
+        results[filenames[0]] = _strip_code_fence(answer_text)
+
+    return results
 
 
 def save_history(path=HISTORY_FILE):

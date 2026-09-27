@@ -68,6 +68,13 @@ create table if not exists files (
     created_at      timestamptz not null default now()
 );
 
+-- "Edit my file" (Built 48) needs the original bytes back later, regardless
+-- of whether Supabase Storage is configured, to carry over a .docx's styles
+-- or a .pdf's page size when building the edited download - so those get a
+-- copy kept right here too, but only for files attached with that feature
+-- turned on (see db.py's save_file(keep_original=...)), not every attachment.
+alter table files add column if not exists original_bytes bytea;
+
 -- Small app-wide settings, one row per key - just the spending limit for
 -- now. A key-value table instead of a dedicated column since this is meant
 -- to grow (more app-wide toggles later) without another migration each time.

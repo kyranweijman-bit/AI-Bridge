@@ -129,8 +129,8 @@ def branch_chat(source_chat_id, up_to_turn_index, new_title=None):
                 (new_id, source_chat_id, up_to_turn_index),
             )
             conn.execute(
-                """insert into files (chat_id, turn_index, filename, storage_path, extracted_text)
-                   select %s, turn_index, filename, storage_path, extracted_text
+                """insert into files (chat_id, turn_index, filename, storage_path, extracted_text, original_bytes)
+                   select %s, turn_index, filename, storage_path, extracted_text, original_bytes
                    from files where chat_id = %s and turn_index <= %s""",
                 (new_id, source_chat_id, up_to_turn_index),
             )
@@ -251,6 +251,17 @@ def _rows_to_turn(rows):
     if third_option is not None:
         result["third_option"] = third_option
 
+    # "Edit my file": each edited file rides as its own extra row (like
+    # conclusion/disagreement_map above) - "role" holds which original
+    # filename it's replacing, "model" holds which model produced it (None
+    # for the modes with one single, sourceless final answer).
+    file_edits = [
+        {"source": r["model"], "filename": r["role"], "edited_text": r["content"]}
+        for r in rows if r["kind"] == "file_edit"
+    ]
+    if file_edits:
+        result["file_edits"] = file_edits
+
     # Quick wins: confidence tags / blind judging were on for this turn -
     # carried in `meta` (see _turn_to_rows) since both apply regardless of mode.
     if meta.get("confidence_tags"):
@@ -337,15 +348,20 @@ def _turn_to_rows(turn, prompt=None):
     ]
 
 
-def add_extra(chat_id, turn_index, mode, kind, model, content, in_context=False):
+def add_extra(chat_id, turn_index, mode, kind, model, content, in_context=False, role=None):
     """Step 22/30: append one more row onto an *existing* turn - a generated
     conclusion, for instance - rather than a new question+answer turn of its
     own. Reuses the same `messages` table and turn_index as the turn it
-    belongs to, just with its own `kind` (e.g. "conclusion")."""
+    belongs to, just with its own `kind` (e.g. "conclusion").
+
+    `role` is free for the kind to reuse as it likes - "edit my file"
+    (Built 48) stores the original filename there for kind="file_edit" rows,
+    since several can share one turn (one per attached file) and need
+    telling apart."""
     _query(
-        """insert into messages (chat_id, turn_index, mode, kind, model, content, in_context)
-           values (%s, %s, %s, %s, %s, %s, %s)""",
-        (chat_id, turn_index, mode, kind, model, content, in_context),
+        """insert into messages (chat_id, turn_index, mode, kind, model, role, content, in_context)
+           values (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (chat_id, turn_index, mode, kind, model, role, content, in_context),
     )
     _query("update chats set updated_at = now() where id = %s", (chat_id,))
 
@@ -587,10 +603,16 @@ def usage_by_model():
 
 # ---- Files ----
 
-def save_file(chat_id, turn_index, filename, extracted_text, file_bytes=None):
+def save_file(chat_id, turn_index, filename, extracted_text, file_bytes=None, keep_original=False):
     """Store the file's text in the database and, if Supabase Storage is
     configured (SUPABASE_URL + SUPABASE_SERVICE_KEY), the original file too.
-    Returns a warning string if the upload failed, otherwise None."""
+    Returns a warning string if the upload failed, otherwise None.
+
+    keep_original=True additionally keeps a copy of file_bytes right here in
+    Postgres (the new `original_bytes` column) - used only for a file
+    attached with "edit my file" turned on, so its .docx styling or .pdf
+    page size can be carried over into the edited download later, without
+    depending on Supabase Storage being configured at all."""
     storage_path, warning = None, None
     if file_bytes is not None:
         try:
@@ -598,10 +620,11 @@ def save_file(chat_id, turn_index, filename, extracted_text, file_bytes=None):
             storage_path = _upload_to_storage(f"{chat_id}/{turn_index}_{safe_name}", file_bytes)
         except Exception as e:
             warning = f"The original file couldn't be stored ({e}); its text was still saved."
+    original_bytes = file_bytes if (keep_original and file_bytes is not None) else None
     _query(
-        """insert into files (chat_id, turn_index, filename, storage_path, extracted_text)
-           values (%s, %s, %s, %s, %s)""",
-        (chat_id, turn_index, filename, storage_path, extracted_text),
+        """insert into files (chat_id, turn_index, filename, storage_path, extracted_text, original_bytes)
+           values (%s, %s, %s, %s, %s, %s)""",
+        (chat_id, turn_index, filename, storage_path, extracted_text, original_bytes),
     )
     return warning
 
@@ -611,6 +634,19 @@ def list_files(chat_id):
         "select id, turn_index, filename, storage_path from files where chat_id = %s order by id",
         (chat_id,),
     )
+
+
+def get_original_file_bytes(chat_id, turn_index, filename):
+    """The original bytes kept for a file attached with keep_original=True,
+    or None if there isn't one (not kept, or several files share this exact
+    name/turn - picks the most recently saved one either way)."""
+    rows = _query(
+        """select original_bytes from files
+           where chat_id = %s and turn_index = %s and filename = %s and original_bytes is not null
+           order by id desc limit 1""",
+        (chat_id, turn_index, filename),
+    )
+    return bytes(rows[0]["original_bytes"]) if rows else None
 
 
 def _upload_to_storage(path, data):

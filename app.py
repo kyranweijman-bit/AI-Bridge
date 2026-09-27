@@ -97,12 +97,16 @@ from bridge import (
     STEELMAN_INSTRUCTION,
     TESTS_NOT_OPINIONS_INSTRUCTION,
     build_third_option_prompt,
+    build_file_edit_instruction,
+    extract_edited_files,
 )
 from pypdf import PdfReader
 from docx import Document
+from fpdf import FPDF
 import html as html_lib
 import random
 import base64
+import io
 
 
 # ---- Step 24: multi-file upload with passage references ----
@@ -163,8 +167,13 @@ IMAGE_EXTENSIONS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/j
                     ".webp": "image/webp", ".gif": "image/gif"}
 MAX_IMAGE_BYTES = 5_000_000
 
+# "Edit my file(s)" - a cap on how many attached files can be edited-and-
+# downloaded at once, so the model isn't asked to juggle rewriting a dozen
+# full files in one answer.
+MAX_FILE_EDIT_FILES = 5
 
-def build_files_prompt(uploaded_files, chat_id, turn_index):
+
+def build_files_prompt(uploaded_files, chat_id, turn_index, keep_originals=False):
     """Extracts, tags and caps every attached file's text, saves each one to
     the database, and returns (text_block, image_blocks) - text_block is the
     combined block to prepend to the prompt, image_blocks is a list of
@@ -176,7 +185,12 @@ def build_files_prompt(uploaded_files, chat_id, turn_index):
     line is, since text_block is what gets stored as this turn's permanent
     context and resent on every future follow-up question in the chat.
     Resending the full image on every later message would be a silent,
-    ongoing token cost the user never asked for."""
+    ongoing token cost the user never asked for.
+
+    keep_originals=True (set when "edit my file" is checked) also keeps each
+    non-image file's original bytes in the database, so the edited download
+    built from it later can carry over a .docx's styling or a .pdf's page
+    size instead of starting from a blank page."""
     tagged_parts, total_len, truncated = [], 0, False
     image_blocks = []
 
@@ -195,7 +209,7 @@ def build_files_prompt(uploaded_files, chat_id, turn_index):
         tagged_parts.append(text)
         total_len += len(text)
 
-        warning = db.save_file(chat_id, turn_index, uf.name, text, uf.getvalue())
+        warning = db.save_file(chat_id, turn_index, uf.name, text, uf.getvalue(), keep_original=keep_originals)
         if warning:
             st.warning(warning)
 
@@ -228,6 +242,88 @@ def build_files_prompt(uploaded_files, chat_id, turn_index):
         f"{chr(10).join(tagged_parts)}"
     )
     return text_block, image_blocks
+
+
+# ---- Edit my file(s), and let me download them again ----
+#
+# Turns the model's answer text (already pulled out of the full answer by
+# bridge.py's extract_edited_files()) into a downloadable file matching the
+# original attachment's type. When the original file's bytes were kept
+# (db.get_original_file_bytes - only true when "edit my file" was checked at
+# upload time), a .docx reuses the original document as a template - each
+# paragraph keeps its own style and its first run's formatting, just with
+# its text replaced - and a .pdf reuses the original page size. This is a
+# best-effort carry-over, not a byte-level edit: tables, headers/footers and
+# inline images in the original are left as they were (nothing there gets
+# text replaced), and if the edited text has a different number of
+# paragraphs than the original, the extra ones are added plainly at the end
+# (or the original's extra paragraphs are simply cleared). A .pdf's *text*
+# is always freshly laid out - true fixed-layout PDF editing (reflowing
+# edited text back into exact original positions) isn't something this app
+# attempts, only its page size is carried over.
+def _apply_edited_text_to_docx(doc, text):
+    new_lines = text.split("\n")
+    paras = doc.paragraphs
+    for idx, para in enumerate(paras):
+        new_text = new_lines[idx] if idx < len(new_lines) else ""
+        if para.runs:
+            para.runs[0].text = new_text
+            for extra_run in para.runs[1:]:
+                extra_run.text = ""
+        else:
+            para.add_run(new_text)
+    for line in new_lines[len(paras):]:
+        doc.add_paragraph(line)
+
+
+def build_edited_file_bytes(text, original_filename, original_bytes=None):
+    ext = os.path.splitext(original_filename)[1].lower()
+    stem = os.path.splitext(original_filename)[0] or "edited"
+
+    if ext == ".docx":
+        doc = None
+        if original_bytes:
+            try:
+                doc = Document(io.BytesIO(original_bytes))
+                _apply_edited_text_to_docx(doc, text)
+            except Exception:
+                doc = None  # a corrupt/unreadable original - fall back below rather than fail the download
+        if doc is None:
+            doc = Document()
+            for line in text.split("\n"):
+                doc.add_paragraph(line)
+        buf = io.BytesIO()
+        doc.save(buf)
+        return (
+            buf.getvalue(),
+            f"{stem}_edited.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    if ext == ".pdf":
+        page_format = "A4"
+        if original_bytes:
+            try:
+                reader = PdfReader(io.BytesIO(original_bytes))
+                mediabox = reader.pages[0].mediabox
+                # PDF points -> mm, what FPDF's format= wants.
+                page_format = (float(mediabox.width) * 0.352778, float(mediabox.height) * 0.352778)
+            except Exception:
+                page_format = "A4"
+        pdf = FPDF(format=page_format)
+        pdf.add_page()
+        pdf.set_font("Helvetica", size=11)
+        for line in text.split("\n"):
+            # The built-in core font is Latin-1 only - swap anything it can't
+            # render for "?" rather than let a stray smart-quote or emoji
+            # crash the download.
+            safe_line = line.encode("latin-1", "replace").decode("latin-1")
+            pdf.multi_cell(0, 6, safe_line)
+        return bytes(pdf.output()), f"{stem}_edited.pdf", "application/pdf"
+
+    # Plain text, Markdown, or code (.py, .csv, ...) - same extension, as text.
+    safe_ext = ext if ext else ".txt"
+    return text.encode("utf-8"), f"{stem}_edited{safe_ext}", "text/plain"
 
 
 # ---- Step 21: storage lives in a database (db.py) ----
@@ -681,6 +777,31 @@ if st.session_state.in_progress is None:
         help="For checkable questions, the models are asked to propose a calculation, experiment or small test that would settle it, rather than just asserting an opinion.",
     )
 
+    # "Edit my file(s), and let me download them again": offered for up to
+    # MAX_FILE_EDIT_FILES non-image attachments at once (several is fine now
+    # - each gets its own marker in the answer so they can be told apart).
+    # Images are out of scope here (that's a different kind of editing).
+    non_image_files = [uf for uf in (uploaded_files or []) if os.path.splitext(uf.name)[1].lower() not in IMAGE_EXTENSIONS]
+    file_edit_mode = False
+    if 1 <= len(non_image_files) <= MAX_FILE_EDIT_FILES:
+        names_label = non_image_files[0].name if len(non_image_files) == 1 \
+            else f"{len(non_image_files)} files: " + ", ".join(uf.name for uf in non_image_files)
+        file_edit_mode = st.checkbox(
+            f"Ask for the edited file(s) back ({names_label})",
+            help='The model is asked to return each attached file\'s complete corrected content; '
+                 'once it answers, a "Download edited file" button appears below for each one - '
+                 "same format when possible (.docx keeps the original's styles, .pdf keeps its "
+                 "page size, plain text/code keeps its extension) rather than a byte-level edit of "
+                 "the original. Works in every mode: One model only and Single review edit "
+                 "directly (Single review uses the reviewer's polished answer); Independent "
+                 "answers gives you back Claude's AND ChatGPT's edited versions separately, so you "
+                 "can pick; Debate and Recipe run one extra quick call at the end to produce the "
+                 "final edited file(s) from the whole discussion, instead of repeating the full "
+                 "file in every round.",
+        )
+    elif len(non_image_files) > MAX_FILE_EDIT_FILES:
+        st.caption(f'Attach at most {MAX_FILE_EDIT_FILES} non-image files to also get a "Download edited file" option for each.')
+
     blind_judging = False
     if mode == "Independent answers":
         blind_judging = st.checkbox(
@@ -697,7 +818,9 @@ if st.session_state.in_progress is None:
             image_blocks = []
 
             if uploaded_files:
-                files_block, image_blocks = build_files_prompt(uploaded_files, chat_id, turn_index)
+                files_block, image_blocks = build_files_prompt(
+                    uploaded_files, chat_id, turn_index, keep_originals=file_edit_mode,
+                )
                 prompt = f"{files_block}\n\nQuestion: {question}"
 
             if preset:
@@ -726,6 +849,8 @@ if st.session_state.in_progress is None:
                 "challenge_assumptions": challenge_assumptions, "tests_not_opinions": tests_not_opinions,
                 "ask_before_debating": ask_before_debating, "debate_length_mode": debate_length_mode,
                 "steelman": steelman,
+                "file_edit_mode": file_edit_mode,
+                "file_edit_filenames": [uf.name for uf in non_image_files] if file_edit_mode else [],
                 "steps": {}, "error": None, "paused": False, "next_round_note": "",
                 "clarification_done": False,
             }
@@ -917,6 +1042,14 @@ else:
         sys_prompt = f"{memory}\n\n{CONFIDENCE_TAG_INSTRUCTION}" if memory else CONFIDENCE_TAG_INSTRUCTION
     if progress.get("tests_not_opinions"):
         sys_prompt = f"{sys_prompt}\n\n{TESTS_NOT_OPINIONS_INSTRUCTION}" if sys_prompt else TESTS_NOT_OPINIONS_INSTRUCTION
+    # "Edit my file(s)": for these three modes, every call already produces
+    # one full candidate answer anyway, so folding the instruction into every
+    # call is free. Debate and Recipe are handled differently, further down
+    # below (one dedicated wrap-up call after the discussion) rather than
+    # asking every round/step to re-embed the whole file(s) every time.
+    if progress.get("file_edit_mode") and mode in ("Single review", "Independent answers", "One model only"):
+        file_edit_instr = build_file_edit_instruction(progress["file_edit_filenames"])
+        sys_prompt = f"{sys_prompt}\n\n{file_edit_instr}" if sys_prompt else file_edit_instr
     new_turn = None
 
     # "Challenge my assumptions": a quick, informational pre-step ahead of
@@ -1132,7 +1265,51 @@ else:
     # only the text belongs in permanent, resend-on-every-follow-up context.
     new_turn["confidence_tags"] = progress.get("confidence_tags", False)
     new_turn["blind_judging"] = progress.get("blind_judging", False)
+
+    # "Edit my file(s)": every mode now has a way to get one or more
+    # candidate edited files back out of it.
+    #  - solo / single review: one source (the reviewer's answer, for single
+    #    review, since that's the one built on top of a critique).
+    #  - independent answers: TWO sources - Claude's and ChatGPT's answers
+    #    were both already asked for the edited file(s), independently.
+    #  - debate / recipe: neither has one clean "final answer" mid-flow, and
+    #    asking for the whole file back on every round/step would be a
+    #    wasteful, repeated cost - so one extra quiet call runs here instead,
+    #    using the whole discussion as context, only when file_edit_mode is on.
+    new_turn["file_edits"] = []
+    if progress.get("file_edit_mode") and progress.get("file_edit_filenames"):
+        filenames = progress["file_edit_filenames"]
+
+        if new_turn["type"] == "solo":
+            for fname, edited_text in extract_edited_files(new_turn["answer"], filenames).items():
+                new_turn["file_edits"].append({"source": new_turn["model"], "filename": fname, "edited_text": edited_text})
+
+        elif new_turn["type"] == "single":
+            reviewer_key = "chatgpt" if new_turn.get("primary", "Claude") == "Claude" else "claude"
+            reviewer_name = "ChatGPT" if reviewer_key == "chatgpt" else "Claude"
+            for fname, edited_text in extract_edited_files(new_turn[reviewer_key], filenames).items():
+                new_turn["file_edits"].append({"source": reviewer_name, "filename": fname, "edited_text": edited_text})
+
+        elif new_turn["type"] == "independent":
+            for model_key, model_name in (("claude", "Claude"), ("chatgpt", "ChatGPT")):
+                for fname, edited_text in extract_edited_files(new_turn[model_key], filenames).items():
+                    new_turn["file_edits"].append({"source": model_name, "filename": fname, "edited_text": edited_text})
+
+        elif new_turn["type"] in ("debate", "recipe"):
+            discussion = turn_transcript_text(new_turn)
+            fe_prompt = f"Question: {question}\n\nDiscussion so far:\n{discussion}\n\n{build_file_edit_instruction(filenames)}"
+            st.caption("Preparing the final edited file(s) from the discussion above...")
+            fe_answer = run_quiet_step(
+                "file_edit_final",
+                lambda: ask_claude([{"role": "user", "content": fe_prompt}], system=memory),
+            )
+            for fname, edited_text in extract_edited_files(fe_answer, filenames).items():
+                new_turn["file_edits"].append({"source": None, "filename": fname, "edited_text": edited_text})
+
     db.add_turn(chat_id, flow_turn_index, new_turn, progress.get("prompt_for_storage", prompt))
+    for edit in new_turn["file_edits"]:
+        db.add_extra(chat_id, flow_turn_index, new_turn["type"], "file_edit", edit["source"], edit["edited_text"],
+                      in_context=False, role=edit["filename"])
     if chat["title"] == "New chat":
         db.rename_chat(chat_id, question[:40])
     st.session_state.in_progress = None
@@ -1254,6 +1431,17 @@ for i, turn in enumerate(chat["display"]):
         st.markdown("**A third option:**")
         show_text(turn["third_option"], view_mode, tagged)
         st.download_button("Download third option", turn["third_option"], file_name=f"third_option_{i}.txt", key=f"dl_third_{i}")
+
+    for edit_idx, edit in enumerate(turn.get("file_edits", [])):
+        original_bytes = db.get_original_file_bytes(chat_id, i, edit["filename"])
+        edited_bytes, edited_dl_name, edited_mime = build_edited_file_bytes(
+            edit["edited_text"], edit["filename"], original_bytes=original_bytes,
+        )
+        source_label = f" ({edit['source']}'s version)" if edit.get("source") else ""
+        st.download_button(
+            f'Download edited "{edited_dl_name}"{source_label}', edited_bytes,
+            file_name=edited_dl_name, mime=edited_mime, key=f"dl_editedfile_{i}_{edit_idx}",
+        )
 
     # Step 22/30 + smarter-collaboration batch: available on every past turn -
     # none of these depend on what happened afterward. Disagreement map and
