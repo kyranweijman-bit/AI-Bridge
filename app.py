@@ -15,7 +15,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
-MAX_FILE_CHARS = 20000  # cap how much of an uploaded file we send, to control cost
+MAX_TOTAL_FILE_CHARS = 60000  # combined cap across every file attached to one question, to control cost
 
 # Load .env right away, before the password check below runs - bridge.py
 # also calls this, but that import happens *after* the password gate, which
@@ -80,27 +80,95 @@ from bridge import (
     REVIEW_INSTRUCTION,
     build_compare_prompt,
     build_debate_message,
+    build_conclusion_prompt,
+    FOLLOWUP_PRESETS,
+    OTHER_MODEL_INSTRUCTION,
+    PROMPT_PRESETS,
+    RECIPE_STEPS,
 )
 from pypdf import PdfReader
 from docx import Document
 
 
-def extract_file_text(uploaded_file):
-    """Step 15: .pdf and .docx are binary formats - decoding them as plain
-    text like before would just produce garbage. This pulls readable text
-    out of each format specifically, and still falls back to plain-text
-    decoding for everything else (.txt, .py, .csv, .md, ...)."""
-    name = uploaded_file.name.lower()
+# ---- Step 24: multi-file upload with passage references ----
+#
+# Each file is broken into tagged chunks - by page for PDFs, by a group of
+# paragraphs for .docx (which has no fixed notion of a "page"), by a group
+# of lines for anything else - so the model can point back at *where* in
+# the file something came from, e.g. "[report.pdf, page 3]", instead of
+# treating the whole document as one undifferentiated blob of text.
 
-    if name.endswith(".pdf"):
+def extract_tagged_text(uploaded_file):
+    name = uploaded_file.name
+
+    if name.lower().endswith(".pdf"):
         reader = PdfReader(uploaded_file)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        chunks = []
+        for i, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if text:
+                chunks.append(f"[{name}, page {i + 1}]\n{text}")
+        return "\n\n".join(chunks)
 
-    if name.endswith(".docx"):
+    if name.lower().endswith(".docx"):
         document = Document(uploaded_file)
-        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+        paragraphs = [p.text for p in document.paragraphs]
+        group_size = 20
+        chunks = []
+        for start in range(0, len(paragraphs), group_size):
+            group = paragraphs[start:start + group_size]
+            text = "\n".join(group).strip()
+            if text:
+                chunks.append(f"[{name}, paragraphs {start + 1}-{start + len(group)}]\n{text}")
+        return "\n\n".join(chunks)
 
-    return uploaded_file.read().decode("utf-8", errors="replace")
+    text = uploaded_file.read().decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return text
+    group_size = 40
+    chunks = []
+    for start in range(0, len(lines), group_size):
+        group = lines[start:start + group_size]
+        chunk_text = "\n".join(group).strip()
+        if chunk_text:
+            chunks.append(f"[{name}, lines {start + 1}-{start + len(group)}]\n{chunk_text}")
+    return "\n\n".join(chunks) if chunks else text
+
+
+def build_files_prompt(uploaded_files, chat_id, turn_index):
+    """Extracts, tags and caps every attached file's text, saves each one to
+    the database, and returns the combined block to prepend to the prompt.
+    Any st.warning() calls happen here, right where the cap is applied."""
+    tagged_parts, total_len, truncated = [], 0, False
+
+    for uf in uploaded_files:
+        text = extract_tagged_text(uf)
+        remaining = MAX_TOTAL_FILE_CHARS - total_len
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(text) > remaining:
+            text = text[:remaining]
+            truncated = True
+        tagged_parts.append(text)
+        total_len += len(text)
+
+        warning = db.save_file(chat_id, turn_index, uf.name, text, uf.getvalue())
+        if warning:
+            st.warning(warning)
+
+    if truncated:
+        st.warning(f"Attached files were longer than {MAX_TOTAL_FILE_CHARS:,} characters combined - only the start was sent.")
+
+    names = ", ".join(uf.name for uf in uploaded_files)
+    return (
+        f"The user attached {len(uploaded_files)} file(s): {names}.\n"
+        "Each passage below is tagged with where it came from, like "
+        "'[filename, page N]' - when you rely on specific content from "
+        "these files, cite the tag it came from.\n\n"
+        f"{chr(10).join(tagged_parts)}"
+    )
 
 
 # ---- Step 21: storage lives in a database (db.py) ----
@@ -137,6 +205,16 @@ if "current_chat_id" not in st.session_state:
     existing = db.list_chats()
     st.session_state.current_chat_id = existing[0][0] if existing else db.create_chat()
 
+# Step 26: the multi-step flow currently running (if any) - which steps
+# already succeeded, and which one (if any) just failed and is waiting to
+# be retried. Step 22/27/30 reuse the same pattern for one-off actions
+# (a conclusion, a follow-up, "add to memory") that don't need retry
+# machinery of their own since they're a single call, not several in a row.
+if "in_progress" not in st.session_state:
+    st.session_state.in_progress = None
+if "pending_action" not in st.session_state:
+    st.session_state.pending_action = None
+
 
 # ---- Sidebar: the chat list ----
 
@@ -144,6 +222,7 @@ st.sidebar.title("Chats")
 
 if st.sidebar.button("+ New chat", use_container_width=True):
     st.session_state.current_chat_id = db.create_chat()
+    st.session_state.in_progress = None
     st.rerun()
 
 search = st.sidebar.text_input("Search chats", placeholder="Search titles and messages")
@@ -160,6 +239,7 @@ for chat_id, title in chat_list:
     with col1:
         if st.button(label, key=f"open_{chat_id}", use_container_width=True):
             st.session_state.current_chat_id = chat_id
+            st.session_state.in_progress = None
             st.rerun()
     with col2:
         if st.button("x", key=f"del_{chat_id}"):
@@ -226,6 +306,37 @@ chat_id = st.session_state.current_chat_id
 turn_index = len(chat["display"])
 memory = db.memory_prompt(chat_id)  # sent to both models as a system prompt
 
+
+def turn_transcript_text(turn):
+    """Step 22/30: the whole "discussion" a turn represents, as plain text -
+    used both to ask for a final conclusion and to fill in a quick
+    "add to memory" save with something more useful than a raw dump."""
+    t = turn.get("type", "single")
+    if t == "single":
+        primary = turn.get("primary", "Claude")
+        reviewer = "ChatGPT" if primary == "Claude" else "Claude"
+        first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
+        second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
+        return f"{primary} answered:\n{first}\n\n{reviewer} reviewed:\n{second}"
+    if t == "independent":
+        return (
+            f"Claude answered:\n{turn['claude']}\n\n"
+            f"ChatGPT answered:\n{turn['chatgpt']}\n\n"
+            f"Comparison:\n{turn['comparison']}"
+        )
+    if t in ("debate", "recipe"):
+        parts = []
+        for entry in turn["transcript"]:
+            if len(entry) == 3:
+                speaker, label, reply = entry
+                parts.append(f"{speaker} ({label}): {reply}")
+            else:
+                speaker, reply = entry
+                parts.append(f"{speaker}: {reply}")
+        return "\n\n".join(parts)
+    return turn.get("answer", "")  # solo
+
+
 title_col, pin_col = st.columns([8, 1])
 title_col.title(chat["title"])
 with pin_col:
@@ -239,154 +350,270 @@ with st.expander("Rename chat"):
         db.rename_chat(chat_id, new_title.strip()[:100])
         st.rerun()
 
-uploaded_file = st.file_uploader("Attach a file (optional)")
-question = st.text_input("Ask a question")
-
-# Step 13/17/18/19: pick per-question how the two models are used.
-mode = st.radio(
-    "Mode",
-    ["Single review", "Independent answers", "Debate", "One model only"],
-    horizontal=True,
+# Step 25: export the whole conversation - every question, its attachments,
+# and every answer/review/comparison/debate-or-recipe reply/conclusion - as
+# one readable Markdown file, instead of only individual answers.
+st.download_button(
+    "Export whole conversation",
+    db.export_chat_text(chat_id),
+    file_name=f"{(chat['title'] or 'chat').strip()[:50]}.md",
+    key="export_chat",
 )
 
-# Extra controls specific to whichever mode is selected.
-if mode == "Single review":
-    primary = st.radio("Who answers first?", ["Claude", "ChatGPT"], horizontal=True)
-elif mode == "Debate":
-    rounds = st.slider("Rounds", min_value=1, max_value=6, value=3)
-    role_col1, role_col2 = st.columns(2)
-    with role_col1:
-        claude_role = st.selectbox("Claude's role", ["Proposer", "Critic", "Fact-checker"], index=0)
-    with role_col2:
-        chatgpt_role = st.selectbox("ChatGPT's role", ["Proposer", "Critic", "Fact-checker"], index=1)
-elif mode == "One model only":
-    which_model = st.radio("Which model?", ["Claude", "ChatGPT"], horizontal=True)
 
-if st.button("Ask") and question:
-    prompt = question
+# =====================================================================
+# Either: show the "ask a new question" form (mode picker, presets, etc.)
+# and handle any one-off action a button lower down just queued up - or,
+# if a multi-step flow is currently running/paused on an error, show its
+# progress/retry controls instead. Never both at once, so a half-finished
+# flow can't be interrupted by starting a second one.
+# =====================================================================
 
-    if uploaded_file is not None:
-        text = extract_file_text(uploaded_file)
-        if len(text) > MAX_FILE_CHARS:
-            text = text[:MAX_FILE_CHARS]
-            st.warning(f"File was longer than {MAX_FILE_CHARS} characters - only the start was sent.")
-        prompt = f"The user attached a file named '{uploaded_file.name}':\n\n{text}\n\nQuestion: {question}"
+if st.session_state.in_progress is None:
 
-        warning = db.save_file(chat_id, turn_index, uploaded_file.name, text, uploaded_file.getvalue())
-        if warning:
-            st.warning(warning)
+    uploaded_files = st.file_uploader("Attach file(s) (optional)", accept_multiple_files=True)
+    question = st.text_input("Ask a question")
 
-    # Step 20: live streaming. Each answer below is shown with st.write_stream()
-    # right here, in this same run, as it's generated - the words appear
-    # progressively instead of a spinner followed by the full text all at
-    # once. st.write_stream() also returns the complete text once the stream
-    # ends, which is what gets saved into chat["history"] / chat["display"]
-    # exactly like before. This doesn't change token usage or cost at all -
-    # same request, same answer, just a different way of displaying it.
+    # Step 29: one-click templates. Picking one fixes the mode (and roles,
+    # for Debate) to whatever suits that kind of question, and prepends a
+    # short instruction to whatever you actually typed - your own question
+    # is always kept, never replaced. Pick "None" for full manual control.
+    preset_name = st.selectbox("Quick start (optional)", ["None"] + list(PROMPT_PRESETS.keys()))
+    preset = PROMPT_PRESETS.get(preset_name)
+
+    MODE_OPTIONS = ["Single review", "Independent answers", "Debate",
+                    "Recipe: Draft -> Critique -> Revise -> Check", "One model only"]
+
+    primary = rounds = claude_role = chatgpt_role = which_model = debate_start = None
+
+    if preset:
+        mode = preset["mode"]
+        primary = preset.get("primary", "Claude")
+        rounds = preset.get("rounds", 3)
+        claude_role = preset.get("claude_role", "Proposer")
+        chatgpt_role = preset.get("chatgpt_role", "Critic")
+        which_model = preset.get("which_model", "Claude")
+        debate_start = "Claude"
+        detail = f" ({primary} first)" if mode == "Single review" else (f" ({which_model})" if mode == "One model only" else "")
+        st.caption(f"Preset **{preset_name}** -> {mode}{detail}.")
+    else:
+        mode = st.radio("Mode", MODE_OPTIONS, horizontal=True)
+        if mode == "Single review":
+            primary = st.radio("Who answers first?", ["Claude", "ChatGPT"], horizontal=True)
+        elif mode == "Debate":
+            rounds = st.slider("Rounds", min_value=1, max_value=6, value=3)
+            debate_start = st.radio("Who starts?", ["Claude", "ChatGPT"], horizontal=True)
+            role_col1, role_col2 = st.columns(2)
+            with role_col1:
+                claude_role = st.selectbox("Claude's role", ["Proposer", "Critic", "Fact-checker"], index=0)
+            with role_col2:
+                chatgpt_role = st.selectbox("ChatGPT's role", ["Proposer", "Critic", "Fact-checker"], index=1)
+        elif mode == "One model only":
+            which_model = st.radio("Which model?", ["Claude", "ChatGPT"], horizontal=True)
+
+    if st.button("Ask") and question:
+        prompt = question
+
+        if uploaded_files:
+            files_block = build_files_prompt(uploaded_files, chat_id, turn_index)
+            prompt = f"{files_block}\n\nQuestion: {question}"
+
+        if preset:
+            prompt = f"{preset['prefix']}\n\n{prompt}"
+
+        st.session_state.in_progress = {
+            "mode": mode, "question": question, "prompt": prompt, "turn_index": turn_index,
+            "primary": primary, "rounds": rounds, "claude_role": claude_role,
+            "chatgpt_role": chatgpt_role, "which_model": which_model, "debate_start": debate_start,
+            "steps": {}, "error": None,
+        }
+        st.rerun()
+
+    # ---- Step 22/27/30: run whichever one-off action a button queued up ----
+    pending = st.session_state.pending_action
+    if pending is not None:
+        st.session_state.pending_action = None
+        target = chat["display"][pending["turn_index"]] if pending["turn_index"] < len(chat["display"]) else None
+
+        if target is None:
+            pass  # the turn it referred to is gone (e.g. chat changed) - just drop it
+
+        elif pending["kind"] == "conclusion":
+            discussion = turn_transcript_text(target)
+            conclusion_prompt = build_conclusion_prompt(target["question"], discussion)
+            try:
+                st.markdown("**Conclusion:**")
+                conclusion_text = st.write_stream(
+                    ask_claude_stream([{"role": "user", "content": conclusion_prompt}], system=memory)
+                )
+                db.add_extra(chat_id, pending["turn_index"], target.get("type", "single"),
+                             "conclusion", "Claude", conclusion_text, in_context=True)
+            except Exception as e:
+                st.error(f"Couldn't generate a conclusion: {e}")
+            st.rerun()
+
+        elif pending["kind"] == "memory":
+            text = (target.get("conclusion") or turn_transcript_text(target))[:2000]
+            db.add_memory(text, chat_id=chat_id)
+            st.rerun()
+
+        elif pending["kind"] == "followup":
+            t = target.get("type", "single")
+            if t == "solo":
+                acting_model = target["model"]
+            elif t == "single":
+                acting_model = target.get("primary", "Claude")
+            else:  # independent - the comparison (last thing in shared history) is always Claude's
+                acting_model = "Claude"
+
+            action = pending["action"]
+            if action == "other_model":
+                speak_model = "ChatGPT" if acting_model == "Claude" else "Claude"
+                instruction = OTHER_MODEL_INSTRUCTION
+            else:
+                speak_model = acting_model
+                instruction = FOLLOWUP_PRESETS[action]
+
+            followup_messages = chat["history"] + [{"role": "user", "content": instruction}]
+            try:
+                st.markdown(f"**{speak_model}:**")
+                stream = ask_claude_stream(followup_messages, system=memory) if speak_model == "Claude" \
+                    else ask_chatgpt_stream(followup_messages, system=memory)
+                answer = st.write_stream(stream)
+                new_turn = {"type": "solo", "question": instruction, "model": speak_model, "answer": answer}
+                db.add_turn(chat_id, turn_index, new_turn, instruction)
+            except Exception as e:
+                st.error(f"That follow-up failed: {e}")
+            st.rerun()
+
+else:
+    # ---- Step 26: a multi-step flow is running, or paused on a failed step ----
+    progress = st.session_state.in_progress
+
+    if progress.get("error"):
+        st.error(f"That step failed: {progress['error']}")
+        retry_col, cancel_col = st.columns(2)
+        if retry_col.button("Retry"):
+            progress["error"] = None
+            st.session_state.in_progress = progress
+            st.rerun()
+        if cancel_col.button("Cancel this question"):
+            st.session_state.in_progress = None
+            st.rerun()
+        st.stop()  # don't attempt anything else until Retry is pressed
+
+    def run_step(step_key, label, make_stream):
+        """Runs one model call within the flow below. A step that already
+        succeeded (on an earlier attempt, before something else failed)
+        replays instantly from cache instead of calling the model again -
+        only the step that actually failed gets retried. A step that raises
+        stops the whole script run here; the error banner above picks it
+        up on the next run."""
+        st.markdown(label)
+        if step_key in progress["steps"]:
+            st.write(progress["steps"][step_key])
+            return progress["steps"][step_key]
+        try:
+            result = st.write_stream(make_stream())
+        except Exception as e:
+            progress["error"] = str(e)
+            st.session_state.in_progress = progress
+            st.rerun()
+        progress["steps"][step_key] = result
+        st.session_state.in_progress = progress
+        return result
+
+    mode = progress["mode"]
+    question = progress["question"]
+    prompt = progress["prompt"]
+    flow_turn_index = progress["turn_index"]
+    new_turn = None
 
     if mode == "Single review":
-        # Step 17: both models get the same shared context - see
-        # second_opinion()'s docstring in bridge.py for how the reviewer
-        # now sees the full history instead of just question+answer.
-        chat["history"].append({"role": "user", "content": prompt})
-
-        st.markdown(f"**{primary}** (answering):")
-        stream = ask_claude_stream(chat["history"], system=memory) if primary == "Claude" else ask_chatgpt_stream(chat["history"], system=memory)
-        first_answer = st.write_stream(stream)
-        chat["history"].append({"role": "assistant", "content": first_answer})
-
+        primary = progress["primary"]
+        history_ctx = chat["history"] + [{"role": "user", "content": prompt}]
+        first_answer = run_step(
+            "first", f"**{primary}** (answering):",
+            lambda: (ask_claude_stream if primary == "Claude" else ask_chatgpt_stream)(history_ctx, system=memory),
+        )
         reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        reviewer_messages = chat["history"] + [{"role": "user", "content": REVIEW_INSTRUCTION}]
-        st.markdown(f"**{reviewer}** (reviewing):")
-        stream = ask_chatgpt_stream(reviewer_messages, system=memory) if reviewer == "ChatGPT" else ask_claude_stream(reviewer_messages, system=memory)
-        second_answer = st.write_stream(stream)
-
-        chat["display"].append({
-            "type": "single",
-            "question": question,
-            "primary": primary,
+        reviewer_messages = history_ctx + [
+            {"role": "assistant", "content": first_answer},
+            {"role": "user", "content": REVIEW_INSTRUCTION},
+        ]
+        second_answer = run_step(
+            "second", f"**{reviewer}** (reviewing):",
+            lambda: (ask_chatgpt_stream if reviewer == "ChatGPT" else ask_claude_stream)(reviewer_messages, system=memory),
+        )
+        new_turn = {
+            "type": "single", "question": question, "primary": primary,
             "claude": first_answer if primary == "Claude" else second_answer,
             "chatgpt": first_answer if primary == "ChatGPT" else second_answer,
-        })
+        }
 
     elif mode == "Independent answers":
-        chat["history"].append({"role": "user", "content": prompt})
-
-        st.markdown("**Claude** (answering independently):")
-        claude_answer = st.write_stream(ask_claude_stream(chat["history"], system=memory))
-
-        st.markdown("**ChatGPT** (answering independently):")
-        chatgpt_answer = st.write_stream(ask_chatgpt_stream(chat["history"], system=memory))
-
+        history_ctx = chat["history"] + [{"role": "user", "content": prompt}]
+        claude_answer = run_step("claude", "**Claude** (answering independently):",
+                                  lambda: ask_claude_stream(history_ctx, system=memory))
+        chatgpt_answer = run_step("chatgpt", "**ChatGPT** (answering independently):",
+                                   lambda: ask_chatgpt_stream(history_ctx, system=memory))
         compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
-        st.markdown("**Comparison:**")
-        comparison = st.write_stream(ask_claude_stream([{"role": "user", "content": compare_prompt}], system=memory))
-
-        # The comparison (which references both answers) becomes this turn's
-        # contribution to the shared history, so a follow-up question has a
-        # single coherent thing to build on rather than two raw answers.
-        chat["history"].append({"role": "assistant", "content": comparison})
-
-        chat["display"].append({
-            "type": "independent",
-            "question": question,
-            "claude": claude_answer,
-            "chatgpt": chatgpt_answer,
-            "comparison": comparison,
-        })
+        comparison = run_step("comparison", "**Comparison:**",
+                               lambda: ask_claude_stream([{"role": "user", "content": compare_prompt}], system=memory))
+        new_turn = {
+            "type": "independent", "question": question,
+            "claude": claude_answer, "chatgpt": chatgpt_answer, "comparison": comparison,
+        }
 
     elif mode == "Debate":
-        # This doesn't touch chat["history"] - it's its own separate side
-        # conversation between the two models, not part of the ongoing
-        # shared context used for follow-up questions. Each round rebuilds
-        # the full transcript-so-far + original question from scratch (via
-        # build_debate_message), same as bridge.py's non-streaming debate().
-        roles = {"claude": claude_role, "chatgpt": chatgpt_role}
+        rounds = progress["rounds"]
+        roles = {"claude": progress["claude_role"], "chatgpt": progress["chatgpt_role"]}
+        speaker = "claude" if progress["debate_start"] == "Claude" else "chatgpt"
         transcript = []
-        speaker = "claude"
-
         for i in range(rounds):
             speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
             role_instruction = ROLE_INSTRUCTIONS[roles[speaker]]
             message = build_debate_message(prompt, transcript, role_instruction)
-
-            st.markdown(f"**{speaker_name}** (round {i + 1}, {roles[speaker]}):")
-            if speaker == "claude":
-                reply = st.write_stream(ask_claude_stream([{"role": "user", "content": message}], system=memory))
-                speaker = "chatgpt"
-            else:
-                reply = st.write_stream(ask_chatgpt_stream([{"role": "user", "content": message}], system=memory))
-                speaker = "claude"
-
+            reply = run_step(
+                f"round_{i}", f"**{speaker_name}** (round {i + 1}, {roles[speaker]}):",
+                (lambda m=message, s=speaker: (ask_claude_stream if s == "claude" else ask_chatgpt_stream)(
+                    [{"role": "user", "content": m}], system=memory)),
+            )
             transcript.append((speaker_name, reply))
+            speaker = "chatgpt" if speaker == "claude" else "claude"
+        new_turn = {
+            "type": "debate", "question": question, "transcript": transcript,
+            "claude_role": progress["claude_role"], "chatgpt_role": progress["chatgpt_role"],
+        }
 
-        chat["display"].append({
-            "type": "debate",
-            "question": question,
-            "transcript": transcript,
-            "claude_role": claude_role,
-            "chatgpt_role": chatgpt_role,
-        })
+    elif mode.startswith("Recipe"):
+        transcript = []
+        for i, (speaker, label, instruction) in enumerate(RECIPE_STEPS):
+            speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
+            so_far = [(s, r) for s, _l, r in transcript]
+            message = build_debate_message(prompt, so_far, instruction)
+            reply = run_step(
+                f"recipe_{i}", f"**{speaker_name}** ({label}):",
+                (lambda m=message, s=speaker: (ask_claude_stream if s == "claude" else ask_chatgpt_stream)(
+                    [{"role": "user", "content": m}], system=memory)),
+            )
+            transcript.append((speaker_name, label, reply))
+        new_turn = {"type": "recipe", "question": question, "transcript": transcript}
 
     else:  # One model only
-        chat["history"].append({"role": "user", "content": prompt})
+        which_model = progress["which_model"]
+        history_ctx = chat["history"] + [{"role": "user", "content": prompt}]
+        answer = run_step(
+            "answer", f"**{which_model}:**",
+            lambda: (ask_claude_stream if which_model == "Claude" else ask_chatgpt_stream)(history_ctx, system=memory),
+        )
+        new_turn = {"type": "solo", "question": question, "model": which_model, "answer": answer}
 
-        st.markdown(f"**{which_model}:**")
-        stream = ask_claude_stream(chat["history"], system=memory) if which_model == "Claude" else ask_chatgpt_stream(chat["history"], system=memory)
-        answer = st.write_stream(stream)
-        chat["history"].append({"role": "assistant", "content": answer})
-
-        chat["display"].append({
-            "type": "solo",
-            "question": question,
-            "model": which_model,
-            "answer": answer,
-        })
-
-    db.add_turn(chat_id, turn_index, chat["display"][-1], prompt)
+    # Every step succeeded - persist the turn and clear the in-progress state.
+    db.add_turn(chat_id, flow_turn_index, new_turn, prompt)
     if chat["title"] == "New chat":
         db.rename_chat(chat_id, question[:40])
-
+    st.session_state.in_progress = None
     st.rerun()
 
 st.divider()
@@ -394,6 +621,8 @@ st.divider()
 # Show the conversation so far, oldest first, each answer with its own
 # download button. Older chats saved before this mode toggle existed have
 # no "type" key, so they're treated as "single" too.
+last_index = len(chat["display"]) - 1
+
 for i, turn in enumerate(chat["display"]):
     st.markdown(f"**You:** {turn['question']}")
 
@@ -406,71 +635,81 @@ for i, turn in enumerate(chat["display"]):
 
         st.markdown(f"**Claude** ({claude_label}):")
         st.write(turn["claude"])
-        st.download_button(
-            "Download Claude's answer",
-            turn["claude"],
-            file_name=f"claude_answer_{i}.txt",
-            key=f"dl_claude_{i}",
-        )
+        st.download_button("Download Claude's answer", turn["claude"], file_name=f"claude_answer_{i}.txt", key=f"dl_claude_{i}")
 
         st.markdown(f"**ChatGPT** ({chatgpt_label}):")
         st.write(turn["chatgpt"])
-        st.download_button(
-            "Download ChatGPT's answer",
-            turn["chatgpt"],
-            file_name=f"chatgpt_answer_{i}.txt",
-            key=f"dl_chatgpt_{i}",
-        )
+        st.download_button("Download ChatGPT's answer", turn["chatgpt"], file_name=f"chatgpt_answer_{i}.txt", key=f"dl_chatgpt_{i}")
 
     elif turn_type == "independent":
-        st.markdown("**Claude** (answered independently):")
-        st.write(turn["claude"])
-        st.download_button(
-            "Download Claude's answer",
-            turn["claude"],
-            file_name=f"claude_answer_{i}.txt",
-            key=f"dl_ind_claude_{i}",
-        )
+        # Quick win 4: the two independent answers side by side, so the
+        # differences the comparison talks about are easy to scan across.
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Claude** (answered independently):")
+            st.write(turn["claude"])
+            st.download_button("Download Claude's answer", turn["claude"], file_name=f"claude_answer_{i}.txt", key=f"dl_ind_claude_{i}")
+        with col_b:
+            st.markdown("**ChatGPT** (answered independently):")
+            st.write(turn["chatgpt"])
+            st.download_button("Download ChatGPT's answer", turn["chatgpt"], file_name=f"chatgpt_answer_{i}.txt", key=f"dl_ind_chatgpt_{i}")
 
-        st.markdown("**ChatGPT** (answered independently):")
-        st.write(turn["chatgpt"])
-        st.download_button(
-            "Download ChatGPT's answer",
-            turn["chatgpt"],
-            file_name=f"chatgpt_answer_{i}.txt",
-            key=f"dl_ind_chatgpt_{i}",
-        )
-
-        st.markdown("**Comparison:**")
+        st.markdown("**Key differences & comparison:**")
         st.write(turn["comparison"])
-        st.download_button(
-            "Download comparison",
-            turn["comparison"],
-            file_name=f"comparison_{i}.txt",
-            key=f"dl_ind_compare_{i}",
-        )
+        st.download_button("Download comparison", turn["comparison"], file_name=f"comparison_{i}.txt", key=f"dl_ind_compare_{i}")
 
     elif turn_type == "solo":
         st.markdown(f"**{turn['model']}:**")
         st.write(turn["answer"])
-        st.download_button(
-            f"Download {turn['model']}'s answer",
-            turn["answer"],
-            file_name=f"{turn['model'].lower()}_answer_{i}.txt",
-            key=f"dl_solo_{i}",
-        )
+        st.download_button(f"Download {turn['model']}'s answer", turn["answer"], file_name=f"{turn['model'].lower()}_answer_{i}.txt", key=f"dl_solo_{i}")
 
-    else:  # debate
-        for j, (speaker, reply) in enumerate(turn["transcript"]):
-            role = turn.get("claude_role") if speaker == "Claude" else turn.get("chatgpt_role")
-            role_label = f", {role}" if role else ""
-            st.markdown(f"**{speaker} (round {j + 1}{role_label}):**")
+    else:  # debate or recipe
+        for j, entry in enumerate(turn["transcript"]):
+            if turn_type == "recipe":
+                speaker, label, reply = entry
+                header = f"**{speaker} ({label}):**"
+                dl_label = f"Download step {j + 1} ({speaker})"
+            else:
+                speaker, reply = entry
+                role = turn.get("claude_role") if speaker == "Claude" else turn.get("chatgpt_role")
+                role_label = f", {role}" if role else ""
+                header = f"**{speaker} (round {j + 1}{role_label}):**"
+                dl_label = f"Download round {j + 1} ({speaker})"
+            st.markdown(header)
             st.write(reply)
-            st.download_button(
-                f"Download round {j + 1} ({speaker})",
-                reply,
-                file_name=f"debate_{i}_round{j + 1}_{speaker.lower()}.txt",
-                key=f"dl_debate_{i}_{j}",
-            )
+            st.download_button(dl_label, reply, file_name=f"{turn_type}_{i}_{j + 1}_{speaker.lower()}.txt", key=f"dl_{turn_type}_{i}_{j}")
+
+    if turn.get("conclusion"):
+        st.markdown("**Conclusion:**")
+        st.write(turn["conclusion"])
+        st.download_button("Download conclusion", turn["conclusion"], file_name=f"conclusion_{i}.txt", key=f"dl_conclusion_{i}")
+
+    # Step 22/30: available on every past turn - a conclusion, or saving its
+    # gist to memory, doesn't depend on what happened afterward.
+    action_col1, action_col2 = st.columns(2)
+    can_act = st.session_state.in_progress is None
+    if action_col1.button("Get final conclusion", key=f"concl_{i}", disabled=not can_act or bool(turn.get("conclusion"))):
+        st.session_state.pending_action = {"kind": "conclusion", "turn_index": i}
+        st.rerun()
+    if action_col2.button("Add to memory", key=f"mem_{i}", disabled=not can_act):
+        st.session_state.pending_action = {"kind": "memory", "turn_index": i}
+        st.rerun()
+
+    # Step 27: "continue from this answer" - only offered on the most recent
+    # turn, and only for the modes that actually feed into the shared
+    # history (debate/recipe are their own separate side conversation, so
+    # there's nothing coherent for a follow-up to build on there).
+    if turn_type in ("solo", "single", "independent") and i == last_index:
+        st.caption("Continue from this answer:")
+        fc = st.columns(4)
+        for col, (action_key, label) in zip(fc, [
+            ("explain", "Explain this"),
+            ("challenge", "Challenge this"),
+            ("practical", "Make it practical"),
+            ("other_model", "Ask the other model"),
+        ]):
+            if col.button(label, key=f"followup_{i}_{action_key}", disabled=not can_act):
+                st.session_state.pending_action = {"kind": "followup", "action": action_key, "based_on_index": i, "turn_index": i}
+                st.rerun()
 
     st.divider()

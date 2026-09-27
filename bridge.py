@@ -242,9 +242,17 @@ REVIEW_INSTRUCTION = "Critique the answer above - point out mistakes or gaps - t
 def build_compare_prompt(question, claude_answer, chatgpt_answer):
     return (
         "Two AI models independently answered the question below, without "
-        "seeing each other's response. Compare their answers: where do they "
-        "agree, where do they disagree, and which parts of each seem more "
-        "reliable?\n\n"
+        "seeing each other's response. Compare their answers.\n\n"
+        # Quick win 4: ask explicitly for a short bulleted list of the
+        # meaningful differences up front, before the fuller prose comparison.
+        # This is still one call (no extra cost) - just a more structured
+        # answer - which is what lets the UI show a scannable list above the
+        # side-by-side answers instead of only a paragraph.
+        "Start your reply with a short bulleted list (at most 5 bullets) "
+        "titled 'Key differences' - only the points where they meaningfully "
+        "disagree or one covers something the other missed. Then, below "
+        "that, give the fuller comparison: where they agree, where they "
+        "disagree, and which parts of each seem more reliable.\n\n"
         f"Question: {question}\n\n"
         f"Model A (Claude):\n{claude_answer}\n\n"
         f"Model B (ChatGPT):\n{chatgpt_answer}"
@@ -287,10 +295,11 @@ ROLE_INSTRUCTIONS = {
 }
 
 
-def debate(question, rounds=3, claude_role="Proposer", chatgpt_role="Critic"):
+def debate(question, rounds=3, claude_role="Proposer", chatgpt_role="Critic", start="claude"):
     """Let the two models go back and forth, each playing an assigned role.
     `rounds` is a hard cap on how many replies get generated in total, so a
-    run can never rack up an open-ended bill.
+    run can never rack up an open-ended bill. `start` (Step 23) picks who
+    opens the debate - "claude" (default) or "chatgpt".
 
     Step 18: every round's message is rebuilt from scratch - the original
     question (which includes any attachment text, since that's baked into
@@ -302,7 +311,7 @@ def debate(question, rounds=3, claude_role="Proposer", chatgpt_role="Critic"):
     the shared `history` list."""
     roles = {"claude": claude_role, "chatgpt": chatgpt_role}
     transcript = []
-    speaker = "claude"
+    speaker = start
 
     for i in range(rounds):
         speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
@@ -337,6 +346,112 @@ def independent_answers(messages, question):
     compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
     comparison = ask_claude([{"role": "user", "content": compare_prompt}])
     return claude_answer, chatgpt_answer, comparison
+
+
+# ---- Step 22: final combined answer ("get the conclusion") ----
+#
+# After a single review, independent-answers comparison, debate or recipe,
+# the app can ask for one more thing: a settled takeaway instead of just the
+# raw transcript. This is a plain follow-up call (using whichever text the
+# app builds from that turn), not a new mode of its own.
+
+CONCLUSION_INSTRUCTION = (
+    "Based on the discussion above, give one final takeaway in three short "
+    "parts: (1) one recommended answer, stated plainly, (2) any "
+    "disagreements between the two models that are still unresolved, and "
+    "(3) anything the user should double-check themselves rather than "
+    "trust as already settled. Be concise - this is a summary, not a new "
+    "essay."
+)
+
+
+def build_conclusion_prompt(question, discussion_text):
+    return f"Question: {question}\n\nDiscussion so far:\n{discussion_text}\n\n{CONCLUSION_INSTRUCTION}"
+
+
+# ---- Step 27: "continue from this answer" quick actions ----
+#
+# Short, one-click follow-ups shown as buttons under a finished answer.
+# Each maps to an instruction appended to the same shared context that
+# produced the answer, sent back to the model that gave it (except
+# "other_model", which is deliberately sent to the *other* model instead).
+
+FOLLOWUP_PRESETS = {
+    "explain": "Explain your last answer above in simpler, plain-language terms, as if to someone new to the topic.",
+    "challenge": "Play devil's advocate against your own last answer above - argue the strongest case against it.",
+    "practical": "Turn your last answer above into a short list of concrete, practical next steps.",
+}
+
+OTHER_MODEL_INSTRUCTION = (
+    "The message above is what the other AI model just said. Give your own "
+    "perspective on it - where you agree, where you disagree, and anything "
+    "you'd add."
+)
+
+
+# ---- Step 29: prompt presets and a built-in multi-step recipe ----
+#
+# Quick, one-click starting points. Each preset pre-picks the mode (and, for
+# Debate, the roles) that tends to suit that kind of question, plus a short
+# instruction prepended to whatever the user actually typed - the user's own
+# question is always kept, never replaced.
+
+PROMPT_PRESETS = {
+    "Review my code": {
+        "mode": "Single review",
+        "primary": "Claude",
+        "prefix": "Review the following code for bugs, readability and best practices.",
+    },
+    "Fact-check this": {
+        "mode": "Debate",
+        "rounds": 2,
+        "claude_role": "Proposer",
+        "chatgpt_role": "Fact-checker",
+        "prefix": "Fact-check the following claim(s) carefully.",
+    },
+    "Explain like I'm new": {
+        "mode": "One model only",
+        "which_model": "Claude",
+        "prefix": "Explain the following as if I'm completely new to the topic - plain language, no jargon.",
+    },
+    "HAN assignment feedback": {
+        "mode": "Single review",
+        "primary": "ChatGPT",
+        "prefix": "Give feedback on the following as if grading a HAN assignment - be specific about what would raise the grade.",
+    },
+}
+
+# The "Draft -> Critique -> Revise -> Final check" recipe from the roadmap:
+# a fixed chain of steps, each one model speaking in turn, every step seeing
+# the original question plus the full chain so far (same shared-context
+# pattern as debate(), reusing build_debate_message below).
+RECIPE_STEPS = [
+    ("claude", "Draft", "Write a first draft answer to the question."),
+    ("chatgpt", "Critique", "Critique the draft above - point out gaps, mistakes or weak reasoning. Do not rewrite it yet."),
+    ("claude", "Revise", "Revise your draft using the critique above. Produce the full improved answer."),
+    ("chatgpt", "Final check", "Do a final check of the revised answer above - confirm it's solid, or flag anything that's still wrong or missing."),
+]
+
+
+def run_recipe(question):
+    """Non-streaming version of the Draft -> Critique -> Revise -> Final
+    check recipe, for terminal use / parity with debate() above. app.py has
+    its own streaming version of the same fixed steps.
+
+    Returned as (speaker, step_label, reply) triples - unlike debate()'s
+    (speaker, reply) pairs - since here the label (Draft/Critique/Revise/
+    Final check) varies step to step instead of being one constant role
+    per speaker."""
+    transcript = []          # (speaker_name, reply) - what build_debate_message needs
+    labeled_transcript = []  # (speaker_name, label, reply) - what's actually returned
+    for speaker, label, instruction in RECIPE_STEPS:
+        message = build_debate_message(question, transcript, instruction)
+        speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
+        reply = ask_claude([{"role": "user", "content": message}]) if speaker == "claude" \
+            else ask_chatgpt([{"role": "user", "content": message}])
+        transcript.append((speaker_name, reply))
+        labeled_transcript.append((speaker_name, label, reply))
+    return labeled_transcript
 
 
 def save_history(path=HISTORY_FILE):

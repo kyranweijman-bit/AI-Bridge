@@ -154,7 +154,7 @@ def _rows_to_turn(rows):
         primary = meta.get("primary", "Claude")
         answer, review = by_model("answer"), by_model("review")
         combined = {**answer, **review}
-        return {
+        result = {
             "type": "single",
             "question": question["content"],
             "primary": primary,
@@ -162,10 +162,10 @@ def _rows_to_turn(rows):
             "chatgpt": combined.get("ChatGPT", ""),
         }
 
-    if mode == "independent":
+    elif mode == "independent":
         answers = by_model("answer")
         comparison = next((r["content"] for r in rows if r["kind"] == "comparison"), "")
-        return {
+        result = {
             "type": "independent",
             "question": question["content"],
             "claude": answers.get("Claude", ""),
@@ -173,8 +173,8 @@ def _rows_to_turn(rows):
             "comparison": comparison,
         }
 
-    if mode == "debate":
-        return {
+    elif mode == "debate":
+        result = {
             "type": "debate",
             "question": question["content"],
             "transcript": [(r["model"], r["content"]) for r in rows if r["kind"] == "debate"],
@@ -182,13 +182,35 @@ def _rows_to_turn(rows):
             "chatgpt_role": meta.get("chatgpt_role"),
         }
 
-    answer = next((r for r in rows if r["kind"] == "answer"), None)
-    return {
-        "type": "solo",
-        "question": question["content"],
-        "model": answer["model"] if answer else meta.get("model", "Claude"),
-        "answer": answer["content"] if answer else "",
-    }
+    elif mode == "recipe":
+        # Step 29: same shape as debate, except each step's label (Draft /
+        # Critique / Revise / Final check) varies per message rather than
+        # being one constant role per speaker - so it's read back from each
+        # row's own "role" column instead of from `meta`.
+        result = {
+            "type": "recipe",
+            "question": question["content"],
+            "transcript": [(r["model"], r["role"], r["content"]) for r in rows if r["kind"] == "recipe"],
+        }
+
+    else:
+        answer = next((r for r in rows if r["kind"] == "answer"), None)
+        result = {
+            "type": "solo",
+            "question": question["content"],
+            "model": answer["model"] if answer else meta.get("model", "Claude"),
+            "answer": answer["content"] if answer else "",
+        }
+
+    # Step 22: a final conclusion, if one was generated for this turn, rides
+    # along as an extra field on top of whatever mode-specific shape above -
+    # every turn type can carry one, generated after the fact by a button
+    # click rather than as part of the turn's own rows.
+    conclusion = next((r["content"] for r in rows if r["kind"] == "conclusion"), None)
+    if conclusion is not None:
+        result["conclusion"] = conclusion
+
+    return result
 
 
 def add_turn(chat_id, turn_index, turn, prompt=None):
@@ -245,10 +267,83 @@ def _turn_to_rows(turn, prompt=None):
                          "role": roles.get(speaker), "round": i + 1, "content": reply})
         return rows
 
+    if mode == "recipe":
+        rows = [{**q}]
+        for i, (speaker, label, reply) in enumerate(turn["transcript"]):
+            rows.append({"mode": mode, "kind": "recipe", "model": speaker,
+                         "role": label, "round": i + 1, "content": reply})
+        return rows
+
     return [
         {**q, "in_context": True, "meta": {"model": turn["model"]}},
         {"mode": mode, "kind": "answer", "model": turn["model"], "content": turn["answer"], "in_context": True},
     ]
+
+
+def add_extra(chat_id, turn_index, mode, kind, model, content, in_context=False):
+    """Step 22/30: append one more row onto an *existing* turn - a generated
+    conclusion, for instance - rather than a new question+answer turn of its
+    own. Reuses the same `messages` table and turn_index as the turn it
+    belongs to, just with its own `kind` (e.g. "conclusion")."""
+    _query(
+        """insert into messages (chat_id, turn_index, mode, kind, model, content, in_context)
+           values (%s, %s, %s, %s, %s, %s, %s)""",
+        (chat_id, turn_index, mode, kind, model, content, in_context),
+    )
+    _query("update chats set updated_at = now() where id = %s", (chat_id,))
+
+
+def export_chat_text(chat_id):
+    """Step 25: the whole conversation as one readable Markdown document -
+    every question, its attachments, and every answer/review/comparison/
+    debate-or-recipe reply/conclusion, in order. Built straight from the
+    same rows load_chat() already reads, so it always matches what's shown
+    on screen."""
+    chat = load_chat(chat_id)
+    if chat is None:
+        return ""
+
+    files_by_turn = {}
+    for f in list_files(chat_id):
+        files_by_turn.setdefault(f["turn_index"], []).append(f["filename"])
+
+    lines = [f"# {chat['title']}", ""]
+    for i, turn in enumerate(chat["display"]):
+        lines.append(f"## Question {i + 1}")
+        lines.append(turn["question"])
+        if files_by_turn.get(i):
+            lines.append("")
+            lines.append(f"*Attached: {', '.join(files_by_turn[i])}*")
+        lines.append("")
+
+        t = turn.get("type", "single")
+        if t == "single":
+            primary = turn.get("primary", "Claude")
+            reviewer = "ChatGPT" if primary == "Claude" else "Claude"
+            lines += [f"**{primary} (answered first):**", turn["claude"] if primary == "Claude" else turn["chatgpt"], ""]
+            lines += [f"**{reviewer} (reviewed):**", turn["chatgpt"] if primary == "Claude" else turn["claude"], ""]
+        elif t == "independent":
+            lines += ["**Claude:**", turn["claude"], "", "**ChatGPT:**", turn["chatgpt"], "",
+                      "**Comparison:**", turn["comparison"], ""]
+        elif t == "solo":
+            lines += [f"**{turn['model']}:**", turn["answer"], ""]
+        elif t in ("debate", "recipe"):
+            for entry in turn["transcript"]:
+                if len(entry) == 3:
+                    speaker, label, reply = entry
+                    lines.append(f"**{speaker} ({label}):**")
+                else:
+                    speaker, reply = entry
+                    lines.append(f"**{speaker}:**")
+                lines += [reply, ""]
+
+        if turn.get("conclusion"):
+            lines += ["**Conclusion:**", turn["conclusion"], ""]
+
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def search_chats(text, limit=20):
