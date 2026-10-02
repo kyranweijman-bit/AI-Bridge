@@ -730,7 +730,12 @@ if st.session_state.in_progress is None:
              "range (e.g. [script.py, lines 1-40]) so answers can cite exactly where something came "
              "from - this already covers Python, JavaScript, and any other code or plain-text file.",
     )
-    question = st.text_input("Ask a question")
+    # Keyed by chat_id, same reasoning as the "working brief" box above: with
+    # no key, Streamlit gives this text_input one key for the whole app, so
+    # whatever you last typed stays in the box even after switching to a
+    # brand-new chat. Keying it per-chat gives each chat its own, empty by
+    # default, without needing to explicitly clear it on every chat switch.
+    question = st.text_input("Ask a question", key=f"question_{chat_id}")
 
     # Depth control: one toggle that sets mode + rounds + token budget
     # together, each preset bounded in both rounds and tokens so it can't
