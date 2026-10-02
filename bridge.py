@@ -508,6 +508,27 @@ RECIPE_STEPS = [
 ]
 
 
+def build_short_recipe_steps(maker, checker):
+    """A short, 2-step alternative to RECIPE_STEPS above: one model makes the
+    thing, one checks it - no Revise or Final-check round. `maker` and
+    `checker` are each "Claude" or "ChatGPT", chosen at ask-time (unlike
+    RECIPE_STEPS' fixed Claude/ChatGPT alternation) - and `checker` can equal
+    `maker`, for a model to check its own work. That works fine here even
+    though it doesn't for Single review mode: a recipe's transcript is
+    stored as a plain ordered list of (speaker, label, reply) rows, never
+    merged or deduplicated by model name, so the same model appearing twice
+    (once as Maker, once as Checker) round-trips through the database with
+    no special-casing needed."""
+    maker_speaker = "claude" if maker == "Claude" else "chatgpt"
+    checker_speaker = "claude" if checker == "Claude" else "chatgpt"
+    return [
+        (maker_speaker, "Make", "Create the product - answer the question in full."),
+        (checker_speaker, "Check",
+         "Check the work above - confirm it's solid, or point out anything that's wrong, missing or "
+         "weak. Do not rewrite it yet."),
+    ]
+
+
 def run_recipe(question):
     """Non-streaming version of the Draft -> Critique -> Revise -> Final
     check recipe, for terminal use / parity with debate() above. app.py has
