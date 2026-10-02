@@ -66,8 +66,21 @@ def close():
 atexit.register(close)
 
 
+def _clean_param(p):
+    """Postgres `text` columns can't store the NUL character (\\x00) - psycopg
+    refuses the whole insert before it even reaches the database if any
+    string parameter contains one. It shows up most often in PDF-extracted
+    text, but this is a blanket safety net so no future caller has to
+    remember to strip it themselves. Non-string params (including bytes,
+    e.g. original_bytes) are passed through untouched."""
+    return p.replace("\x00", "") if isinstance(p, str) else p
+
+
 def _query(sql, params=None):
     """Run one SQL statement and return its rows as dicts (or [] if none)."""
+    if params:
+        params = tuple(_clean_param(p) for p in params) if not isinstance(params, dict) \
+            else {k: _clean_param(v) for k, v in params.items()}
     with _get_pool().connection() as conn:
         cur = conn.execute(sql, params)
         return cur.fetchall() if cur.description else []
@@ -183,15 +196,31 @@ def _rows_to_turn(rows):
 
     if mode == "single":
         primary = meta.get("primary", "Claude")
-        answer, review = by_model("answer"), by_model("review")
-        combined = {**answer, **review}
+        reviewer = meta.get("reviewer") or ("ChatGPT" if primary == "Claude" else "Claude")
+        # Looked up directly by kind (there's only ever one answer row and
+        # one review row per turn), not merged into a model-keyed dict like
+        # independent's two answers are - a self-check turn has primary ==
+        # reviewer, so a model-keyed merge would collide and silently lose
+        # the answer under the review (or vice versa).
+        answer_row = next((r for r in rows if r["kind"] == "answer"), None)
+        review_row = next((r for r in rows if r["kind"] == "review"), None)
+        first_answer = answer_row["content"] if answer_row else ""
+        second_answer = review_row["content"] if review_row else ""
         result = {
             "type": "single",
             "question": question["content"],
             "primary": primary,
-            "claude": combined.get("Claude", ""),
-            "chatgpt": combined.get("ChatGPT", ""),
+            "reviewer": reviewer,
+            "first_answer": first_answer,
+            "second_answer": second_answer,
         }
+        # claude/chatgpt stay populated for the normal (non-self-check) case
+        # only, since older code (and the normal rendering path) reads them
+        # directly - they're meaningless when reviewer == primary, since
+        # both answer and review would then be "the same model's" text.
+        if reviewer != primary:
+            result["claude"] = first_answer if primary == "Claude" else second_answer
+            result["chatgpt"] = first_answer if primary == "ChatGPT" else second_answer
 
     elif mode == "independent":
         answers = by_model("answer")
@@ -310,22 +339,41 @@ def _turn_to_rows(turn, prompt=None):
 
     if mode == "single":
         primary = turn.get("primary", "Claude")
-        reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
-        second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
+        # "reviewer" defaults to the other model (the original behavior) but
+        # can equal `primary` - self-check, the same model reviewing its own
+        # answer. It's stored in meta (read back in _rows_to_turn) so a
+        # self-check turn round-trips correctly instead of being guessed
+        # back out as "the other model" on reload.
+        reviewer = turn.get("reviewer") or ("ChatGPT" if primary == "Claude" else "Claude")
+        # NOTE: this must be an if/else, not turn.get("first_answer", turn["claude"]...)
+        # - dict.get()'s default argument is evaluated eagerly even when the
+        # key IS present, so that would raise KeyError on every self-check
+        # turn (which never has "claude"/"chatgpt" keys at all).
+        if "first_answer" in turn:
+            first, second = turn["first_answer"], turn["second_answer"]
+        else:
+            first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
+            second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
         return [
-            {**q, "in_context": True, "meta": {"primary": primary, **extra_meta}},
+            {**q, "in_context": True, "meta": {"primary": primary, "reviewer": reviewer, **extra_meta}},
             {"mode": mode, "kind": "answer", "model": primary, "content": first, "in_context": True},
             {"mode": mode, "kind": "review", "model": reviewer, "content": second},
         ]
 
     if mode == "independent":
-        return [
+        rows = [
             {**q, "in_context": True, "meta": extra_meta},
             {"mode": mode, "kind": "answer", "model": "Claude", "content": turn["claude"]},
             {"mode": mode, "kind": "answer", "model": "ChatGPT", "content": turn["chatgpt"]},
-            {"mode": mode, "kind": "comparison", "model": "Claude", "content": turn["comparison"], "in_context": True},
         ]
+        # The "Stop" feature lets you keep both answers but skip the
+        # comparison call - turn.get("comparison") is None in that case, and
+        # there's simply no comparison row at all (not a row with empty
+        # content), so _rows_to_turn's existing `next(..., "")` default on
+        # read already does the right thing.
+        if turn.get("comparison"):
+            rows.append({"mode": mode, "kind": "comparison", "model": "Claude", "content": turn["comparison"], "in_context": True})
+        return rows
 
     if mode == "debate":
         roles = {"Claude": turn.get("claude_role"), "ChatGPT": turn.get("chatgpt_role")}

@@ -7,3 +7,4 @@ python-docx
 psycopg[binary,pool]
 httpx
 fpdf2
+openpyxl

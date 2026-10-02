@@ -86,6 +86,7 @@ from bridge import (
     OTHER_MODEL_INSTRUCTION,
     PROMPT_PRESETS,
     RECIPE_STEPS,
+    build_short_recipe_steps,
     DEPTH_PRESETS,
     CONFIDENCE_TAG_INSTRUCTION,
     build_disagreement_map_prompt,
@@ -103,6 +104,7 @@ from bridge import (
 from pypdf import PdfReader
 from docx import Document
 from fpdf import FPDF
+import openpyxl
 import html as html_lib
 import random
 import base64
@@ -118,6 +120,17 @@ import io
 # treating the whole document as one undifferentiated blob of text.
 
 def extract_tagged_text(uploaded_file):
+    """Thin wrapper around _extract_tagged_text_raw() that strips NUL bytes
+    (\\x00) from whatever comes back. PDF text extraction (pypdf) quite often
+    returns stray NULs, especially from PDFs with odd font encodings or ones
+    exported from Word - and Postgres `text` columns can't store them at all,
+    so without this, saving that file (or any answer/file_edit that quotes
+    it) would fail with a database error. Stripping them loses nothing
+    meaningful; they're invisible junk, not real content."""
+    return _extract_tagged_text_raw(uploaded_file).replace("\x00", "")
+
+
+def _extract_tagged_text_raw(uploaded_file):
     name = uploaded_file.name
 
     if name.lower().endswith(".pdf"):
@@ -140,6 +153,35 @@ def extract_tagged_text(uploaded_file):
             if text:
                 chunks.append(f"[{name}, paragraphs {start + 1}-{start + len(group)}]\n{text}")
         return "\n\n".join(chunks)
+
+    if name.lower().endswith((".xlsx", ".xlsm")):
+        # Without this branch, an .xlsx fell through to the plain-text
+        # fallback below, which just decodes the file's raw zip/XML bytes -
+        # the model then "sees" sheet1.xml and sharedStrings.xml instead of
+        # any actual cell values. openpyxl reads the real rows instead.
+        # data_only=True returns each formula's last-saved cached value
+        # (not the formula text) - if the workbook was never opened/saved in
+        # Excel/Sheets after a formula changed, that cached value can be
+        # stale or missing (shows up as a blank cell here).
+        try:
+            workbook = openpyxl.load_workbook(uploaded_file, data_only=True, read_only=True)
+        except Exception as e:
+            return f"[{name}]\n(Could not read this spreadsheet: {e}. Only .xlsx/.xlsm are supported - a legacy .xls needs to be saved as .xlsx first.)"
+        group_size = 40
+        chunks = []
+        for sheet in workbook.worksheets:
+            rows = []
+            for row in sheet.iter_rows(values_only=True):
+                if all(cell is None for cell in row):
+                    continue
+                rows.append(" | ".join("" if cell is None else str(cell) for cell in row))
+            for start in range(0, len(rows), group_size):
+                group = rows[start:start + group_size]
+                text = "\n".join(group).strip()
+                if text:
+                    chunks.append(f"[{name}, sheet '{sheet.title}', rows {start + 1}-{start + len(group)}]\n{text}")
+        workbook.close()
+        return "\n\n".join(chunks) if chunks else f"[{name}]\n(This spreadsheet appears to be empty.)"
 
     text = uploaded_file.read().decode("utf-8", errors="replace")
     lines = text.splitlines()
@@ -342,59 +384,6 @@ except Exception as e:
     st.error(f"Couldn't connect to the database: {e}")
     st.info("Check DATABASE_URL in .env (locally) or in the app's Secrets on Streamlit Cloud. See SETUP_DATABASE.md.")
     st.stop()
-
-
-# ---- Speed: remember database reads between clicks ----
-#
-# Streamlit reruns this whole script on every click, and each run used to
-# make ~20 separate round trips to Supabase (chat list, memories, brief,
-# personas, decisions, votes, usage, settings, the chat itself, the export,
-# original file bytes...). Most of that data hadn't changed since the last
-# click, so reads are now remembered (st.cache_data) and the whole memory is
-# wiped the moment anything is written. The functions are swapped inside the
-# db module itself, so every existing db.xxx() call - and db.py's own
-# internal calls, e.g. export_chat_text() -> load_chat() - use it
-# automatically. DB_CACHE_SECONDS is a safety net for changes made outside
-# this app (e.g. a chat added through api.py): those show up within that
-# many seconds.
-import functools
-
-DB_CACHE_SECONDS = 30
-
-_DB_READS = [
-    "list_chats", "search_chats", "load_chat", "export_chat_text", "list_files",
-    "list_memories", "memory_prompt", "get_setting", "get_vote", "vote_stats",
-    "list_personas", "get_brief", "list_decisions", "usage_summary", "usage_by_model",
-    "get_original_file_bytes",
-]
-_DB_WRITES = [
-    "create_chat", "delete_chat", "rename_chat", "set_pinned", "branch_chat",
-    "add_turn", "add_extra", "add_memory", "delete_memory", "set_setting",
-    "add_vote", "add_persona", "delete_persona", "set_brief", "add_decision",
-    "set_decision_outcome", "log_usage", "save_file",
-]
-
-
-def _clears_cache(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            st.cache_data.clear()
-    return wrapper
-
-
-if not getattr(db, "_cached_by_app", False):  # only wrap once per server process
-    for _name in _DB_READS:
-        setattr(db, _name, st.cache_data(ttl=DB_CACHE_SECONDS, show_spinner=False)(getattr(db, _name)))
-    for _name in _DB_WRITES:
-        setattr(db, _name, _clears_cache(getattr(db, _name)))
-    db._cached_by_app = True
-
-# Rebuilding an edited .docx/.pdf for its download button is also slow-ish,
-# and the result never changes for the same text + original file.
-build_edited_file_bytes_cached = st.cache_data(show_spinner=False, max_entries=50)(build_edited_file_bytes)
 
 
 def _log_usage(provider, model, input_tokens, output_tokens, cost):
@@ -628,15 +617,20 @@ def turn_transcript_text(turn):
     t = turn.get("type", "single")
     if t == "single":
         primary = turn.get("primary", "Claude")
-        reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
-        second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
-        return f"{primary} answered:\n{first}\n\n{reviewer} reviewed:\n{second}"
+        reviewer = turn.get("reviewer") or ("ChatGPT" if primary == "Claude" else "Claude")
+        if "first_answer" in turn:
+            first, second = turn["first_answer"], turn["second_answer"]
+        else:  # legacy shape (chats saved before self-check existed)
+            first = turn["claude"] if primary == "Claude" else turn["chatgpt"]
+            second = turn["chatgpt"] if primary == "Claude" else turn["claude"]
+        review_label = "reviewed its own answer" if reviewer == primary else "reviewed"
+        return f"{primary} answered:\n{first}\n\n{reviewer} {review_label}:\n{second}"
     if t == "independent":
+        comparison = turn.get("comparison") or "(not generated - stopped before the comparison step)"
         return (
             f"Claude answered:\n{turn['claude']}\n\n"
             f"ChatGPT answered:\n{turn['chatgpt']}\n\n"
-            f"Comparison:\n{turn['comparison']}"
+            f"Comparison:\n{comparison}"
         )
     if t in ("debate", "recipe"):
         parts = []
@@ -726,19 +720,22 @@ st.download_button(
 # flow can't be interrupted by starting a second one.
 # =====================================================================
 
-# Speed: the "ask a question" controls live in a fragment, so changing Mode,
-# Depth, Quick start, roles, rounds or any checkbox reruns ONLY this block
-# instead of the whole page (sidebar, chat history, database reads...).
-# Pressing Ask still does a full rerun (st.rerun() below), because that has
-# to start the flow further down. Needs Streamlit 1.37 or newer.
-@st.fragment
-def ask_form():
+if st.session_state.in_progress is None:
 
     uploaded_files = st.file_uploader(
-        "Attach file(s) (optional) - text, PDF, Word, or an image (PNG/JPG/WEBP/GIF)",
+        "Attach file(s) (optional) - text, code (Python, JS, or any other language), "
+        "PDF, Word, Excel (.xlsx/.xlsm), or an image (PNG/JPG/WEBP/GIF)",
         accept_multiple_files=True,
+        help="Anything not specifically PDF/Word/Excel/an image is read as plain text, tagged by line "
+             "range (e.g. [script.py, lines 1-40]) so answers can cite exactly where something came "
+             "from - this already covers Python, JavaScript, and any other code or plain-text file.",
     )
-    question = st.text_input("Ask a question")
+    # Keyed by chat_id, same reasoning as the "working brief" box above: with
+    # no key, Streamlit gives this text_input one key for the whole app, so
+    # whatever you last typed stays in the box even after switching to a
+    # brand-new chat. Keying it per-chat gives each chat its own, empty by
+    # default, without needing to explicitly clear it on every chat switch.
+    question = st.text_input("Ask a question", key=f"question_{chat_id}")
 
     # Depth control: one toggle that sets mode + rounds + token budget
     # together, each preset bounded in both rounds and tokens so it can't
@@ -756,14 +753,17 @@ def ask_form():
     preset = PROMPT_PRESETS.get(preset_name)
 
     MODE_OPTIONS = ["Single review", "Independent answers", "Debate",
-                    "Recipe: Draft -> Critique -> Revise -> Check", "One model only"]
+                    "Recipe: Draft -> Critique -> Revise -> Check",
+                    "Recipe: Make -> Check (short)", "One model only"]
 
     primary = rounds = claude_role = chatgpt_role = which_model = debate_start = None
     max_tokens = None
-    pause_between_rounds = False
+    pause_between_steps = False
     ask_before_debating = False
     debate_length_mode = "Fixed rounds"
     steelman = False
+    self_check = False  # Single review: reviewer is the other model unless this is on
+    short_recipe_maker = short_recipe_checker = None
 
     if preset:
         mode = preset["mode"]
@@ -791,6 +791,12 @@ def ask_form():
         mode = st.radio("Mode", MODE_OPTIONS, horizontal=True)
         if mode == "Single review":
             primary = st.radio("Who answers first?", ["Claude", "ChatGPT"], horizontal=True)
+            self_check = st.checkbox(
+                "Have the same model check its own work, instead of the other one",
+                help="Off (default): the other model reviews it, like a second pair of eyes. On: "
+                     "whichever model answered is asked to review its own answer, in a separate "
+                     "follow-up call.",
+            )
         elif mode == "Debate":
             rounds = st.slider("Rounds", min_value=1, max_value=6, value=3)
             debate_start = st.radio("Who starts?", ["Claude", "ChatGPT"], horizontal=True)
@@ -800,10 +806,6 @@ def ask_form():
                 claude_role = st.selectbox("Claude's role", role_options, index=0)
             with role_col2:
                 chatgpt_role = st.selectbox("ChatGPT's role", role_options, index=1)
-            pause_between_rounds = st.checkbox(
-                "Pause after each round so I can stop or steer it", value=True,
-                help="Uncheck to run straight through all rounds automatically, like before.",
-            )
             ask_before_debating = st.checkbox(
                 "Ask a clarifying question first, if one would matter",
                 help="One quick check before round 1: if an important detail is missing, you're asked "
@@ -820,8 +822,28 @@ def ask_form():
             steelman = st.checkbox(
                 "Steelman first - each side restates the other's point fairly before responding",
             )
+        elif mode == "Recipe: Make -> Check (short)":
+            short_recipe_maker = st.radio("Who makes it?", ["Claude", "ChatGPT"], horizontal=True)
+            short_recipe_self_check = st.checkbox(
+                "Have the same model check its own work, instead of the other one",
+                help="Off (default): the other model checks it. On: the same model that made it is "
+                     "asked to check its own work, in a separate follow-up call.",
+            )
+            short_recipe_checker = short_recipe_maker if short_recipe_self_check \
+                else ("ChatGPT" if short_recipe_maker == "Claude" else "Claude")
         elif mode == "One model only":
             which_model = st.radio("Which model?", ["Claude", "ChatGPT"], horizontal=True)
+
+    # Pause/Stop control: shared by every multi-step mode (not One model
+    # only, which has just the one call) - after each step, choose to
+    # continue, add a note (Debate only), or stop here and keep just what's
+    # done so far, instead of the remaining step(s) running automatically
+    # even when the first reply already wasn't useful.
+    if mode != "One model only":
+        pause_between_steps = st.checkbox(
+            "Pause after each step so I can stop or steer it", value=True,
+            help="Uncheck to run straight through to the end automatically, like before.",
+        )
 
     confidence_tags = st.checkbox(
         "Add confidence tags (sure / fairly sure / guessing) to claims",
@@ -904,20 +926,17 @@ def ask_form():
                 "primary": primary, "rounds": rounds, "claude_role": claude_role,
                 "chatgpt_role": chatgpt_role, "which_model": which_model, "debate_start": debate_start,
                 "max_tokens": max_tokens, "confidence_tags": confidence_tags,
-                "blind_judging": blind_judging, "pause_between_rounds": pause_between_rounds,
+                "blind_judging": blind_judging, "pause_between_steps": pause_between_steps,
                 "challenge_assumptions": challenge_assumptions, "tests_not_opinions": tests_not_opinions,
                 "ask_before_debating": ask_before_debating, "debate_length_mode": debate_length_mode,
-                "steelman": steelman,
+                "steelman": steelman, "self_check": self_check,
+                "short_recipe_maker": short_recipe_maker, "short_recipe_checker": short_recipe_checker,
                 "file_edit_mode": file_edit_mode,
                 "file_edit_filenames": [uf.name for uf in non_image_files] if file_edit_mode else [],
                 "steps": {}, "error": None, "paused": False, "next_round_note": "",
-                "clarification_done": False,
+                "clarification_done": False, "stopped_early": False, "stopped_after_both": False,
             }
-            st.rerun(scope="app")
-
-
-if st.session_state.in_progress is None:
-    ask_form()
+            st.rerun()
 
     # ---- Step 22/27/30: run whichever one-off action a button queued up ----
     pending = st.session_state.pending_action
@@ -1124,41 +1143,140 @@ else:
             lambda: ask_claude_stream([{"role": "user", "content": build_challenge_assumptions_prompt(question)}], system=sys_prompt),
         )
 
+    def pause_checkpoint(waiting_label, continue_label, stop_label, stop_flag_key, cancel_key, already_done):
+        """Shared Continue/Stop here/Cancel widget for the checkpoints below
+        (and reused by Independent answers' second checkpoint). Mirrors
+        Debate's existing pause/Continue/Stop pattern (Built 27), generalized
+        so Single review, Independent answers and Recipe get the same
+        "stop before the next step runs" control Debate already had -
+        instead of every remaining step firing automatically even when the
+        first reply already wasn't useful. Returns True if it displayed the
+        checkpoint UI and halted the script (st.stop()) - callers should
+        just fall through to the normal step when it returns False."""
+        if not (progress.get("paused") and already_done and not progress.get(stop_flag_key)):
+            return False
+        st.info(waiting_label)
+        c1, c2, c3 = st.columns(3)
+        if c1.button(continue_label, key=f"{cancel_key}_continue"):
+            progress["paused"] = False
+            st.session_state.in_progress = progress
+            st.rerun()
+        if c2.button(stop_label, key=f"{cancel_key}_stop"):
+            progress[stop_flag_key] = True
+            progress["paused"] = False
+            st.session_state.in_progress = progress
+            st.rerun()
+        if c3.button("Cancel this question", key=f"{cancel_key}_cancel"):
+            st.session_state.in_progress = None
+            st.rerun()
+        st.stop()
+        return True  # unreachable - st.stop() above never returns
+
     if mode == "Single review":
         primary = progress["primary"]
+        pause_on = progress.get("pause_between_steps", False)
+        self_check = progress.get("self_check", False)
         history_ctx = chat["history"] + [{"role": "user", "content": prompt}]
+
+        # One-shot flag: True only when "first" was ALREADY cached before this
+        # run_step call below, i.e. this run is a later one (after a retry or
+        # a Continue click) rather than the run that just computed it. Pausing
+        # must key off this, not off "second" being missing (which stays true
+        # across many runs) - otherwise the pause would re-trigger forever
+        # right after every Continue click, instead of letting "second" run.
+        first_already_done = "first" in progress["steps"]
+
+        if pause_on:
+            pause_checkpoint(
+                "Paused after the first answer.", "Continue to review",
+                "Stop here - keep just this answer", "stopped_early", "single_pause",
+                already_done=(first_already_done and "second" not in progress["steps"]),
+            )
+
         first_answer = run_step(
             "first", f"**{primary}** (answering):",
             lambda: (ask_claude_stream if primary == "Claude" else ask_chatgpt_stream)(history_ctx, system=sys_prompt, max_tokens=mt),
         )
-        reviewer = "ChatGPT" if primary == "Claude" else "Claude"
-        reviewer_messages = history_ctx + [
-            {"role": "assistant", "content": first_answer},
-            {"role": "user", "content": REVIEW_INSTRUCTION},
-        ]
-        second_answer = run_step(
-            "second", f"**{reviewer}** (reviewing):",
-            lambda: (ask_chatgpt_stream if reviewer == "ChatGPT" else ask_claude_stream)(reviewer_messages, system=sys_prompt, max_tokens=mt),
-        )
-        new_turn = {
-            "type": "single", "question": question, "primary": primary,
-            "claude": first_answer if primary == "Claude" else second_answer,
-            "chatgpt": first_answer if primary == "ChatGPT" else second_answer,
-        }
+
+        if progress.get("stopped_early"):
+            new_turn = {"type": "solo", "question": question, "model": primary, "answer": first_answer}
+        else:
+            if pause_on and not first_already_done and not progress.get("paused"):
+                progress["paused"] = True
+                st.session_state.in_progress = progress
+                st.rerun()
+
+            reviewer = primary if self_check else ("ChatGPT" if primary == "Claude" else "Claude")
+            reviewer_messages = history_ctx + [
+                {"role": "assistant", "content": first_answer},
+                {"role": "user", "content": REVIEW_INSTRUCTION},
+            ]
+            second_answer = run_step(
+                "second", f"**{reviewer}** (reviewing):",
+                lambda: (ask_chatgpt_stream if reviewer == "ChatGPT" else ask_claude_stream)(reviewer_messages, system=sys_prompt, max_tokens=mt),
+            )
+            new_turn = {
+                "type": "single", "question": question, "primary": primary, "reviewer": reviewer,
+                "first_answer": first_answer, "second_answer": second_answer,
+            }
+            # claude/chatgpt only mean something when the two differ - see
+            # db.py's _rows_to_turn for why a self-check turn leaves them out.
+            if reviewer != primary:
+                new_turn["claude"] = first_answer if primary == "Claude" else second_answer
+                new_turn["chatgpt"] = first_answer if primary == "ChatGPT" else second_answer
 
     elif mode == "Independent answers":
+        pause_on = progress.get("pause_between_steps", False)
         history_ctx = chat["history"] + [{"role": "user", "content": prompt}]
+
+        claude_already_done = "claude" in progress["steps"]
+        if pause_on:
+            pause_checkpoint(
+                "Paused after Claude's answer.", "Continue to ChatGPT's answer",
+                "Stop here - keep just Claude's answer", "stopped_early", "ind_pause1",
+                already_done=(claude_already_done and "chatgpt" not in progress["steps"]),
+            )
+
         claude_answer = run_step("claude", "**Claude** (answering independently):",
                                   lambda: ask_claude_stream(history_ctx, system=sys_prompt, max_tokens=mt))
-        chatgpt_answer = run_step("chatgpt", "**ChatGPT** (answering independently):",
-                                   lambda: ask_chatgpt_stream(history_ctx, system=sys_prompt, max_tokens=mt))
-        compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
-        comparison = run_step("comparison", "**Comparison:**",
-                               lambda: ask_claude_stream([{"role": "user", "content": compare_prompt}], system=sys_prompt, max_tokens=mt))
-        new_turn = {
-            "type": "independent", "question": question,
-            "claude": claude_answer, "chatgpt": chatgpt_answer, "comparison": comparison,
-        }
+
+        if progress.get("stopped_early"):
+            new_turn = {"type": "solo", "question": question, "model": "Claude", "answer": claude_answer}
+        else:
+            if pause_on and not claude_already_done and not progress.get("paused"):
+                progress["paused"] = True
+                st.session_state.in_progress = progress
+                st.rerun()
+
+            chatgpt_already_done = "chatgpt" in progress["steps"]
+            if pause_on:
+                pause_checkpoint(
+                    "Paused after both answers.", "Continue to the comparison",
+                    "Stop here - skip the comparison", "stopped_after_both", "ind_pause2",
+                    already_done=(chatgpt_already_done and "comparison" not in progress["steps"]),
+                )
+
+            chatgpt_answer = run_step("chatgpt", "**ChatGPT** (answering independently):",
+                                       lambda: ask_chatgpt_stream(history_ctx, system=sys_prompt, max_tokens=mt))
+
+            if progress.get("stopped_after_both"):
+                new_turn = {
+                    "type": "independent", "question": question,
+                    "claude": claude_answer, "chatgpt": chatgpt_answer, "comparison": None,
+                }
+            else:
+                if pause_on and not chatgpt_already_done and not progress.get("paused"):
+                    progress["paused"] = True
+                    st.session_state.in_progress = progress
+                    st.rerun()
+
+                compare_prompt = build_compare_prompt(question, claude_answer, chatgpt_answer)
+                comparison = run_step("comparison", "**Comparison:**",
+                                       lambda: ask_claude_stream([{"role": "user", "content": compare_prompt}], system=sys_prompt, max_tokens=mt))
+                new_turn = {
+                    "type": "independent", "question": question,
+                    "claude": claude_answer, "chatgpt": chatgpt_answer, "comparison": comparison,
+                }
 
     elif mode == "Debate":
         # Step: stop and intervene. With "pause after each round" on, only
@@ -1169,7 +1287,7 @@ else:
         # normal finalize-the-turn path below picks it up unchanged.
         rounds = progress["rounds"]
         roles = {"claude": progress["claude_role"], "chatgpt": progress["chatgpt_role"]}
-        pause_on = progress.get("pause_between_rounds", False)
+        pause_on = progress.get("pause_between_steps", False)
         length_mode = progress.get("debate_length_mode", "Fixed rounds")
         # More roles and personas: saved personas (db.py's personas table)
         # are looked up alongside the fixed Proposer/Critic/Fact-checker/
@@ -1299,18 +1417,68 @@ else:
         }
 
     elif mode.startswith("Recipe"):
+        # Same shared-context chain as Debate, just with a fixed sequence of
+        # labeled steps instead of alternating rounds - and now, like Debate,
+        # a while-loop (not a plain for-loop) so pausing/stopping between
+        # steps is possible. The short recipe's steps are built fresh each
+        # time from whichever maker/checker was chosen at ask-time (self-
+        # check included); the long recipe's are the fixed RECIPE_STEPS.
+        recipe_steps = build_short_recipe_steps(progress["short_recipe_maker"], progress["short_recipe_checker"]) \
+            if mode == "Recipe: Make -> Check (short)" else RECIPE_STEPS
+        total_steps = len(recipe_steps)
+        pause_on = progress.get("pause_between_steps", False)
+        # "Stop here" shrinks this down to what's already done, exactly like
+        # Debate's `rounds` truncation - the loop below just stops sooner.
+        steps_to_run = progress.get("recipe_steps_to_run", total_steps)
+
         transcript = []
-        for i, (speaker, label, instruction) in enumerate(RECIPE_STEPS):
+        for i, (speaker, label, _instruction) in enumerate(recipe_steps):
+            key = f"recipe_{i}"
+            if key not in progress["steps"]:
+                break
+            speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
+            st.markdown(f"**{speaker_name}** ({label}):")
+            st.write(progress["steps"][key])
+            transcript.append((speaker_name, label, progress["steps"][key]))
+        completed = len(transcript)
+
+        if pause_on and progress.get("paused") and completed < steps_to_run:
+            st.info(f"Paused after step {completed} of {total_steps}.")
+            c1, c2, c3 = st.columns(3)
+            if c1.button("Continue", key="recipe_continue"):
+                progress["paused"] = False
+                st.session_state.in_progress = progress
+                st.rerun()
+            if c2.button("Stop here", key="recipe_stop"):
+                progress["recipe_steps_to_run"] = completed
+                progress["paused"] = False
+                st.session_state.in_progress = progress
+                st.rerun()
+            if c3.button("Cancel this question", key="recipe_cancel"):
+                st.session_state.in_progress = None
+                st.rerun()
+            st.stop()
+
+        while completed < steps_to_run:
+            i = completed
+            speaker, label, instruction = recipe_steps[i]
             speaker_name = "Claude" if speaker == "claude" else "ChatGPT"
             so_far = [(s, r) for s, _l, r in transcript]
             message = build_debate_message(prompt, so_far, instruction)
-            st.caption(f"Step {i + 1} of {len(RECIPE_STEPS)} - {speaker_name} ({label})")  # Step: stage indicator
+            st.caption(f"Step {i + 1} of {total_steps} - {speaker_name} ({label})")  # Step: stage indicator
             reply = run_step(
                 f"recipe_{i}", f"**{speaker_name}** ({label}):",
                 (lambda m=message, s=speaker: (ask_claude_stream if s == "claude" else ask_chatgpt_stream)(
                     [{"role": "user", "content": m}], system=sys_prompt, max_tokens=mt)),
             )
             transcript.append((speaker_name, label, reply))
+            completed += 1
+
+            if pause_on and completed < steps_to_run:
+                progress["paused"] = True
+                st.session_state.in_progress = progress
+                st.rerun()
+
         new_turn = {"type": "recipe", "question": question, "transcript": transcript}
 
     else:  # One model only
@@ -1348,9 +1516,12 @@ else:
                 new_turn["file_edits"].append({"source": new_turn["model"], "filename": fname, "edited_text": edited_text})
 
         elif new_turn["type"] == "single":
-            reviewer_key = "chatgpt" if new_turn.get("primary", "Claude") == "Claude" else "claude"
-            reviewer_name = "ChatGPT" if reviewer_key == "chatgpt" else "Claude"
-            for fname, edited_text in extract_edited_files(new_turn[reviewer_key], filenames).items():
+            reviewer_name = new_turn.get("reviewer") or ("ChatGPT" if new_turn.get("primary", "Claude") == "Claude" else "Claude")
+            reviewer_text = new_turn.get("second_answer")
+            if reviewer_text is None:  # legacy shape fallback (no first_answer/second_answer fields)
+                reviewer_key = "chatgpt" if new_turn.get("primary", "Claude") == "Claude" else "claude"
+                reviewer_text = new_turn[reviewer_key]
+            for fname, edited_text in extract_edited_files(reviewer_text, filenames).items():
                 new_turn["file_edits"].append({"source": reviewer_name, "filename": fname, "edited_text": edited_text})
 
         elif new_turn["type"] == "independent":
@@ -1385,12 +1556,7 @@ st.divider()
 # no "type" key, so they're treated as "single" too.
 last_index = len(chat["display"]) - 1
 
-
-# Speed: each past turn is its own fragment, so flipping its "View as"
-# switch or typing in its decision box only redraws that one turn. Buttons
-# inside still call st.rerun(), which refreshes the whole page as before.
-@st.fragment
-def render_turn(i, turn):
+for i, turn in enumerate(chat["display"]):
     st.markdown(f"**You:** {turn['question']}")
 
     turn_type = turn.get("type", "single")
@@ -1404,16 +1570,34 @@ def render_turn(i, turn):
 
     if turn_type == "single":
         primary = turn.get("primary", "Claude")  # chats saved before this existed default to Claude-first
-        claude_label = "answered first" if primary == "Claude" else "reviewed"
-        chatgpt_label = "answered first" if primary == "ChatGPT" else "reviewed"
+        reviewer = turn.get("reviewer") or ("ChatGPT" if primary == "Claude" else "Claude")
 
-        st.markdown(f"**Claude** ({claude_label}):")
-        show_text(turn["claude"], view_mode, tagged)
-        st.download_button("Download Claude's answer", turn["claude"], file_name=f"claude_answer_{i}.txt", key=f"dl_claude_{i}")
+        if reviewer == primary:
+            # Self-check: the same model answered and reviewed itself - shown
+            # under one model's name with "answered"/"reviewed its own
+            # answer" labels, rather than the normal Claude/ChatGPT two-row
+            # layout (which would misleadingly look like two different
+            # models spoke).
+            first_answer = turn.get("first_answer", "")
+            second_answer = turn.get("second_answer", "")
+            st.markdown(f"**{primary}** (answered):")
+            show_text(first_answer, view_mode, tagged)
+            st.download_button(f"Download {primary}'s answer", first_answer, file_name=f"{primary.lower()}_answer_{i}.txt", key=f"dl_single_first_{i}")
 
-        st.markdown(f"**ChatGPT** ({chatgpt_label}):")
-        show_text(turn["chatgpt"], view_mode, tagged)
-        st.download_button("Download ChatGPT's answer", turn["chatgpt"], file_name=f"chatgpt_answer_{i}.txt", key=f"dl_chatgpt_{i}")
+            st.markdown(f"**{reviewer}** (reviewed its own answer):")
+            show_text(second_answer, view_mode, tagged)
+            st.download_button(f"Download {reviewer}'s self-review", second_answer, file_name=f"{reviewer.lower()}_selfreview_{i}.txt", key=f"dl_single_second_{i}")
+        else:
+            claude_label = "answered first" if primary == "Claude" else "reviewed"
+            chatgpt_label = "answered first" if primary == "ChatGPT" else "reviewed"
+
+            st.markdown(f"**Claude** ({claude_label}):")
+            show_text(turn["claude"], view_mode, tagged)
+            st.download_button("Download Claude's answer", turn["claude"], file_name=f"claude_answer_{i}.txt", key=f"dl_claude_{i}")
+
+            st.markdown(f"**ChatGPT** ({chatgpt_label}):")
+            show_text(turn["chatgpt"], view_mode, tagged)
+            st.download_button("Download ChatGPT's answer", turn["chatgpt"], file_name=f"chatgpt_answer_{i}.txt", key=f"dl_chatgpt_{i}")
 
     elif turn_type == "independent":
         # Quick win: blind judging - only for turns asked with it on, and
@@ -1460,9 +1644,12 @@ def render_turn(i, turn):
                 show_text(turn["chatgpt"], view_mode, tagged)
                 st.download_button("Download ChatGPT's answer", turn["chatgpt"], file_name=f"chatgpt_answer_{i}.txt", key=f"dl_ind_chatgpt_{i}")
 
-            st.markdown("**Key differences & comparison:**")
-            show_text(turn["comparison"], view_mode, tagged)
-            st.download_button("Download comparison", turn["comparison"], file_name=f"comparison_{i}.txt", key=f"dl_ind_compare_{i}")
+            if turn.get("comparison"):
+                st.markdown("**Key differences & comparison:**")
+                show_text(turn["comparison"], view_mode, tagged)
+                st.download_button("Download comparison", turn["comparison"], file_name=f"comparison_{i}.txt", key=f"dl_ind_compare_{i}")
+            else:
+                st.caption("No comparison - you stopped before that step ran.")
 
     elif turn_type == "solo":
         st.markdown(f"**{turn['model']}:**")
@@ -1502,7 +1689,7 @@ def render_turn(i, turn):
 
     for edit_idx, edit in enumerate(turn.get("file_edits", [])):
         original_bytes = db.get_original_file_bytes(chat_id, i, edit["filename"])
-        edited_bytes, edited_dl_name, edited_mime = build_edited_file_bytes_cached(
+        edited_bytes, edited_dl_name, edited_mime = build_edited_file_bytes(
             edit["edited_text"], edit["filename"], original_bytes=original_bytes,
         )
         source_label = f" ({edit['source']}'s version)" if edit.get("source") else ""
@@ -1566,7 +1753,3 @@ def render_turn(i, turn):
                 st.rerun()
 
     st.divider()
-
-
-for i, turn in enumerate(chat["display"]):
-    render_turn(i, turn)
