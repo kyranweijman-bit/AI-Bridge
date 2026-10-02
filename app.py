@@ -118,6 +118,17 @@ import io
 # treating the whole document as one undifferentiated blob of text.
 
 def extract_tagged_text(uploaded_file):
+    """Thin wrapper around _extract_tagged_text_raw() that strips NUL bytes
+    (\\x00) from whatever comes back. PDF text extraction (pypdf) quite often
+    returns stray NULs, especially from PDFs with odd font encodings or ones
+    exported from Word - and Postgres `text` columns can't store them at all,
+    so without this, saving that file (or any answer/file_edit that quotes
+    it) would fail with a database error. Stripping them loses nothing
+    meaningful; they're invisible junk, not real content."""
+    return _extract_tagged_text_raw(uploaded_file).replace("\x00", "")
+
+
+def _extract_tagged_text_raw(uploaded_file):
     name = uploaded_file.name
 
     if name.lower().endswith(".pdf"):
@@ -342,59 +353,6 @@ except Exception as e:
     st.error(f"Couldn't connect to the database: {e}")
     st.info("Check DATABASE_URL in .env (locally) or in the app's Secrets on Streamlit Cloud. See SETUP_DATABASE.md.")
     st.stop()
-
-
-# ---- Speed: remember database reads between clicks ----
-#
-# Streamlit reruns this whole script on every click, and each run used to
-# make ~20 separate round trips to Supabase (chat list, memories, brief,
-# personas, decisions, votes, usage, settings, the chat itself, the export,
-# original file bytes...). Most of that data hadn't changed since the last
-# click, so reads are now remembered (st.cache_data) and the whole memory is
-# wiped the moment anything is written. The functions are swapped inside the
-# db module itself, so every existing db.xxx() call - and db.py's own
-# internal calls, e.g. export_chat_text() -> load_chat() - use it
-# automatically. DB_CACHE_SECONDS is a safety net for changes made outside
-# this app (e.g. a chat added through api.py): those show up within that
-# many seconds.
-import functools
-
-DB_CACHE_SECONDS = 30
-
-_DB_READS = [
-    "list_chats", "search_chats", "load_chat", "export_chat_text", "list_files",
-    "list_memories", "memory_prompt", "get_setting", "get_vote", "vote_stats",
-    "list_personas", "get_brief", "list_decisions", "usage_summary", "usage_by_model",
-    "get_original_file_bytes",
-]
-_DB_WRITES = [
-    "create_chat", "delete_chat", "rename_chat", "set_pinned", "branch_chat",
-    "add_turn", "add_extra", "add_memory", "delete_memory", "set_setting",
-    "add_vote", "add_persona", "delete_persona", "set_brief", "add_decision",
-    "set_decision_outcome", "log_usage", "save_file",
-]
-
-
-def _clears_cache(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            st.cache_data.clear()
-    return wrapper
-
-
-if not getattr(db, "_cached_by_app", False):  # only wrap once per server process
-    for _name in _DB_READS:
-        setattr(db, _name, st.cache_data(ttl=DB_CACHE_SECONDS, show_spinner=False)(getattr(db, _name)))
-    for _name in _DB_WRITES:
-        setattr(db, _name, _clears_cache(getattr(db, _name)))
-    db._cached_by_app = True
-
-# Rebuilding an edited .docx/.pdf for its download button is also slow-ish,
-# and the result never changes for the same text + original file.
-build_edited_file_bytes_cached = st.cache_data(show_spinner=False, max_entries=50)(build_edited_file_bytes)
 
 
 def _log_usage(provider, model, input_tokens, output_tokens, cost):
@@ -726,13 +684,7 @@ st.download_button(
 # flow can't be interrupted by starting a second one.
 # =====================================================================
 
-# Speed: the "ask a question" controls live in a fragment, so changing Mode,
-# Depth, Quick start, roles, rounds or any checkbox reruns ONLY this block
-# instead of the whole page (sidebar, chat history, database reads...).
-# Pressing Ask still does a full rerun (st.rerun() below), because that has
-# to start the flow further down. Needs Streamlit 1.37 or newer.
-@st.fragment
-def ask_form():
+if st.session_state.in_progress is None:
 
     uploaded_files = st.file_uploader(
         "Attach file(s) (optional) - text, PDF, Word, or an image (PNG/JPG/WEBP/GIF)",
@@ -913,11 +865,7 @@ def ask_form():
                 "steps": {}, "error": None, "paused": False, "next_round_note": "",
                 "clarification_done": False,
             }
-            st.rerun(scope="app")
-
-
-if st.session_state.in_progress is None:
-    ask_form()
+            st.rerun()
 
     # ---- Step 22/27/30: run whichever one-off action a button queued up ----
     pending = st.session_state.pending_action
@@ -1385,12 +1333,7 @@ st.divider()
 # no "type" key, so they're treated as "single" too.
 last_index = len(chat["display"]) - 1
 
-
-# Speed: each past turn is its own fragment, so flipping its "View as"
-# switch or typing in its decision box only redraws that one turn. Buttons
-# inside still call st.rerun(), which refreshes the whole page as before.
-@st.fragment
-def render_turn(i, turn):
+for i, turn in enumerate(chat["display"]):
     st.markdown(f"**You:** {turn['question']}")
 
     turn_type = turn.get("type", "single")
@@ -1502,7 +1445,7 @@ def render_turn(i, turn):
 
     for edit_idx, edit in enumerate(turn.get("file_edits", [])):
         original_bytes = db.get_original_file_bytes(chat_id, i, edit["filename"])
-        edited_bytes, edited_dl_name, edited_mime = build_edited_file_bytes_cached(
+        edited_bytes, edited_dl_name, edited_mime = build_edited_file_bytes(
             edit["edited_text"], edit["filename"], original_bytes=original_bytes,
         )
         source_label = f" ({edit['source']}'s version)" if edit.get("source") else ""
@@ -1566,7 +1509,3 @@ def render_turn(i, turn):
                 st.rerun()
 
     st.divider()
-
-
-for i, turn in enumerate(chat["display"]):
-    render_turn(i, turn)

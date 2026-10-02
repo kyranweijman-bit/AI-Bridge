@@ -66,8 +66,21 @@ def close():
 atexit.register(close)
 
 
+def _clean_param(p):
+    """Postgres `text` columns can't store the NUL character (\\x00) - psycopg
+    refuses the whole insert before it even reaches the database if any
+    string parameter contains one. It shows up most often in PDF-extracted
+    text, but this is a blanket safety net so no future caller has to
+    remember to strip it themselves. Non-string params (including bytes,
+    e.g. original_bytes) are passed through untouched."""
+    return p.replace("\x00", "") if isinstance(p, str) else p
+
+
 def _query(sql, params=None):
     """Run one SQL statement and return its rows as dicts (or [] if none)."""
+    if params:
+        params = tuple(_clean_param(p) for p in params) if not isinstance(params, dict) \
+            else {k: _clean_param(v) for k, v in params.items()}
     with _get_pool().connection() as conn:
         cur = conn.execute(sql, params)
         return cur.fetchall() if cur.description else []
