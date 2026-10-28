@@ -105,6 +105,7 @@ from pypdf import PdfReader
 from docx import Document
 from fpdf import FPDF
 import openpyxl
+from notebook import extract_notebook, build_edited_notebook
 import html as html_lib
 import random
 import base64
@@ -182,6 +183,11 @@ def _extract_tagged_text_raw(uploaded_file):
                     chunks.append(f"[{name}, sheet '{sheet.title}', rows {start + 1}-{start + len(group)}]\n{text}")
         workbook.close()
         return "\n\n".join(chunks) if chunks else f"[{name}]\n(This spreadsheet appears to be empty.)"
+
+    if name.lower().endswith(".ipynb"):
+        # Raw notebook JSON wastes the character budget on escaping, metadata
+        # and base64 plot images - see notebook.py. One tagged passage per cell.
+        return extract_notebook(name, uploaded_file.getvalue())
 
     text = uploaded_file.read().decode("utf-8", errors="replace")
     lines = text.splitlines()
@@ -362,6 +368,9 @@ def build_edited_file_bytes(text, original_filename, original_bytes=None):
             safe_line = line.encode("latin-1", "replace").decode("latin-1")
             pdf.multi_cell(0, 6, safe_line)
         return bytes(pdf.output()), f"{stem}_edited.pdf", "application/pdf"
+
+    if ext == ".ipynb":
+        return build_edited_notebook(text, original_bytes), f"{stem}_edited.ipynb", "application/x-ipynb+json"
 
     # Plain text, Markdown, or code (.py, .csv, ...) - same extension, as text.
     safe_ext = ext if ext else ".txt"
@@ -724,9 +733,10 @@ if st.session_state.in_progress is None:
 
     uploaded_files = st.file_uploader(
         "Attach file(s) (optional) - text, code (Python, JS, or any other language), "
-        "PDF, Word, Excel (.xlsx/.xlsm), or an image (PNG/JPG/WEBP/GIF)",
+        "PDF, Word, Excel (.xlsx/.xlsm), Jupyter notebooks (.ipynb), or an image (PNG/JPG/WEBP/GIF)",
         accept_multiple_files=True,
-        help="Anything not specifically PDF/Word/Excel/an image is read as plain text, tagged by line "
+        help="Notebooks are read cell by cell (e.g. [analysis.ipynb, cell 3 (code)]), with plot images left out. "
+             "Anything not specifically PDF/Word/Excel/a notebook/an image is read as plain text, tagged by line "
              "range (e.g. [script.py, lines 1-40]) so answers can cite exactly where something came "
              "from - this already covers Python, JavaScript, and any other code or plain-text file.",
     )
