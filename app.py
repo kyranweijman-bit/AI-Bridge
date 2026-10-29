@@ -15,7 +15,10 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
-MAX_TOTAL_FILE_CHARS = 60000  # combined cap across every file attached to one question, to control cost
+MAX_TOTAL_FILE_CHARS = 60000  # default combined cap across every file attached to one question, to control cost
+# Picked per question under the uploader. The higher limits are for big
+# files like a full course notebook; roughly 4 characters = 1 token.
+FILE_CHAR_LIMIT_OPTIONS = [60000, 120000, 200000]
 
 # Load .env right away, before the password check below runs - bridge.py
 # also calls this, but that import happens *after* the password gate, which
@@ -221,7 +224,36 @@ MAX_IMAGE_BYTES = 5_000_000
 MAX_FILE_EDIT_FILES = 5
 
 
-def build_files_prompt(uploaded_files, chat_id, turn_index, keep_originals=False):
+@st.cache_data(show_spinner=False, max_entries=20)
+def _extract_cached(name, data):
+    """extract_tagged_text() on a copy of the file's bytes, cached so the
+    live size check under the uploader (which runs on every rerun) and the
+    real send on Ask don't re-parse the same PDF/notebook each time."""
+    buf = io.BytesIO(data)
+    buf.name = name
+    return extract_tagged_text(buf)
+
+
+def _estimate_input_cost(chars):
+    """Rough $ for sending this many characters once to each model, or
+    None for a model missing from bridge.PRICING. ~4 characters per token."""
+    tokens = chars / 4
+    out = {}
+    for label, model in (("Claude", bridge.CLAUDE_MODEL), ("ChatGPT", bridge.OPENAI_MODEL)):
+        rates = bridge.PRICING.get(model)
+        out[label] = None if rates is None else tokens / 1_000_000 * rates["input"]
+    return tokens, out
+
+
+def _last_tag_before(text, limit):
+    """The last passage tag (e.g. '[x.ipynb, cell 41 (code)]') that starts
+    within the first `limit` characters - i.e. roughly where a cut lands."""
+    import re as _re
+    tags = _re.findall(r"^\[[^\]\n]+\]$", text[:limit], _re.MULTILINE)
+    return tags[-1] if tags else None
+
+
+def build_files_prompt(uploaded_files, chat_id, turn_index, keep_originals=False, char_limit=MAX_TOTAL_FILE_CHARS):
     """Extracts, tags and caps every attached file's text, saves each one to
     the database, and returns (text_block, image_blocks) - text_block is the
     combined block to prepend to the prompt, image_blocks is a list of
@@ -246,8 +278,8 @@ def build_files_prompt(uploaded_files, chat_id, turn_index, keep_originals=False
     image_files = [uf for uf in uploaded_files if os.path.splitext(uf.name)[1].lower() in IMAGE_EXTENSIONS]
 
     for uf in text_files:
-        text = extract_tagged_text(uf)
-        remaining = MAX_TOTAL_FILE_CHARS - total_len
+        text = _extract_cached(uf.name, uf.getvalue())
+        remaining = char_limit - total_len
         if remaining <= 0:
             truncated = True
             break
@@ -279,7 +311,8 @@ def build_files_prompt(uploaded_files, chat_id, turn_index, keep_originals=False
             st.warning(warning)
 
     if truncated:
-        st.warning(f"Attached files were longer than {MAX_TOTAL_FILE_CHARS:,} characters combined - only the start was sent.")
+        st.warning(f"Attached files were longer than {char_limit:,} characters combined - only the start was sent. "
+                   "Pick a higher 'Attachment size limit' under the uploader to send all of it.")
 
     names = ", ".join(uf.name for uf in uploaded_files)
     text_block = (
@@ -745,6 +778,51 @@ if st.session_state.in_progress is None:
     # whatever you last typed stays in the box even after switching to a
     # brand-new chat. Keying it per-chat gives each chat its own, empty by
     # default, without needing to explicitly clear it on every chat switch.
+    # Attachment size limit + live check, so you see BEFORE asking whether
+    # a big file (e.g. a 100-cell notebook) would get cut off, where, and
+    # roughly what one send costs. Images aren't counted - they're sent
+    # separately and don't use this budget.
+    file_char_limit = MAX_TOTAL_FILE_CHARS
+    if uploaded_files:
+        text_uploads = [uf for uf in uploaded_files
+                        if os.path.splitext(uf.name)[1].lower() not in IMAGE_EXTENSIONS]
+        if text_uploads:
+            file_char_limit = st.selectbox(
+                "Attachment size limit",
+                FILE_CHAR_LIMIT_OPTIONS,
+                format_func=lambda n: f"{n:,} characters (≈ {n // 4:,} tokens)"
+                                      + (" - default" if n == MAX_TOTAL_FILE_CHARS else ""),
+                key=f"file_char_limit_{chat_id}",
+                help="How much of the attached files' text is sent with this question. Higher = the "
+                     "models see more of a big file, but every model call costs more - and the "
+                     "files stay part of this chat's context, so follow-up questions resend them too.",
+            )
+            total_chars = 0
+            combined = []
+            for uf in text_uploads:
+                try:
+                    extracted = _extract_cached(uf.name, uf.getvalue())
+                except Exception:
+                    extracted = ""
+                total_chars += len(extracted)
+                combined.append(extracted)
+            sent_chars = min(total_chars, file_char_limit)
+            tokens, costs = _estimate_input_cost(sent_chars)
+            # "\\$" - a bare "$...$" pair is read by Streamlit as LaTeX math.
+            cost_bits = [f"{label} ≈ \\${c:.3f}" if c is not None else f"{label}: no price known"
+                         for label, c in costs.items()]
+            st.caption(f"Attached text: {total_chars:,} characters (≈ {total_chars // 4:,} tokens). "
+                       f"Sent per model call: ≈ {int(tokens):,} tokens, {', '.join(cost_bits)}. "
+                       "Multi-model modes make several calls.")
+            if total_chars > file_char_limit:
+                cut_at = _last_tag_before("\n\n".join(combined), file_char_limit)
+                where = f" It gets cut off partway through {cut_at}." if cut_at else ""
+                fits = next((n for n in FILE_CHAR_LIMIT_OPTIONS if n >= total_chars), None)
+                advice = (f" Pick {fits:,} to send all of it." if fits and fits != file_char_limit
+                          else " Even the highest limit can't fit all of it - split the file or ask about one part at a time.")
+                st.warning(f"Only the first {file_char_limit:,} of {total_chars:,} characters would be sent "
+                           f"({file_char_limit * 100 // total_chars}%).{where}{advice}")
+
     question = st.text_input("Ask a question", key=f"question_{chat_id}")
 
     # Depth control: one toggle that sets mode + rounds + token budget
@@ -890,6 +968,16 @@ if st.session_state.in_progress is None:
                  "final edited file(s) from the whole discussion, instead of repeating the full "
                  "file in every round.",
         )
+        # The edited file has to fit inside ONE reply, so a big file can't
+        # come back whole - say so up front instead of handing back a
+        # download that silently stops halfway through.
+        if file_edit_mode:
+            reply_limit = max_tokens or bridge.MAX_TOKENS
+            edit_tokens = sum(len(_extract_cached(uf.name, uf.getvalue())) for uf in non_image_files) // 4
+            if edit_tokens > reply_limit * 0.8:
+                st.warning(f"These file(s) are ≈ {edit_tokens:,} tokens, but one reply can be at most "
+                           f"{reply_limit:,} tokens - the edited version would be cut off. Ask for "
+                           "feedback instead and apply it yourself, or edit a smaller part at a time.")
     elif len(non_image_files) > MAX_FILE_EDIT_FILES:
         st.caption(f'Attach at most {MAX_FILE_EDIT_FILES} non-image files to also get a "Download edited file" option for each.')
 
@@ -911,6 +999,7 @@ if st.session_state.in_progress is None:
             if uploaded_files:
                 files_block, image_blocks = build_files_prompt(
                     uploaded_files, chat_id, turn_index, keep_originals=file_edit_mode,
+                    char_limit=file_char_limit,
                 )
                 prompt = f"{files_block}\n\nQuestion: {question}"
 
